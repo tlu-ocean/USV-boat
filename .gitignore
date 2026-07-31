@@ -1,0 +1,26 @@
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Collected sensor data
+data/*
+!data/.gitkeep
+
+# Runtime program logs
+logs/*
+!logs/.gitkeep
+
+# MAVProxy outputs
+*.tlog
+*.tlog.raw
+mav.parm
+
+# Local editor and OS files
+.DS_Store
+.vscode/
+.idea/
+
+# Secrets and machine-local overrides
+config/local*
+*.key
+*.pem
