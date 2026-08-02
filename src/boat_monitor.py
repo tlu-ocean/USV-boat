@@ -12,8 +12,8 @@ import serial
 from pymavlink import mavutil
 
 # Device enable switches
-ENABLE_PIXHAWK = False
-ENABLE_LIDAR = False
+ENABLE_PIXHAWK = True
+ENABLE_LIDAR = True
 
 # Serial configuration
 PIXHAWK_PORT = "/dev/serial0"
