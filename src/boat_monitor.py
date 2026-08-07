@@ -9,11 +9,14 @@ from pathlib import Path
 from typing import Optional
 
 import serial
+import board
+import adafruit_bme280.basic as adafruit_bme280
 from pymavlink import mavutil
 
 # Device enable switches
 ENABLE_PIXHAWK = True
 ENABLE_LIDAR = True
+ENABLE_BME280 = True
 
 # Serial configuration
 PIXHAWK_PORT = "/dev/serial0"
@@ -21,6 +24,8 @@ PIXHAWK_BAUD = 115200
 
 LIDAR_PORT = "/dev/ttyAMA3"
 LIDAR_BAUD = 115200
+
+BME280_ADDRESS = 0x76
 
 # Runtime configuration
 PRINT_INTERVAL_S = 1.0
@@ -31,6 +36,7 @@ PIXHAWK_STALE_S = 3.0
 GPS_STALE_S = 3.0
 RC_STALE_S = 3.0
 LIDAR_STALE_S = 1.0
+BME280_STALE_S = 3.0
 
 PROJECT_DIR = Path.home() / "boat"
 DATA_DIR = PROJECT_DIR / "data"
@@ -66,14 +72,19 @@ class SharedState:
     lidar_strength: Optional[int] = None
     lidar_temperature_c: Optional[float] = None
 
+    air_temperature_c: Optional[float] = None
+    relative_humidity_pct: Optional[float] = None
+    air_pressure_hpa: Optional[float] = None
+
     pixhawk_last_update: Optional[float] = None
     gps_last_update: Optional[float] = None
     rc_last_update: Optional[float] = None
     lidar_last_update: Optional[float] = None
-
+    bme280_last_update: Optional[float] = None
+    
     pixhawk_error: Optional[str] = None
     lidar_error: Optional[str] = None
-
+    bme280_error: Optional[str] = None
 
 def age_seconds(last_update: Optional[float], now: float) -> Optional[float]:
     if last_update is None:
@@ -344,6 +355,62 @@ def read_lidar(
             )
             stop_event.wait(RECONNECT_DELAY_S)
 
+def read_bme280(
+    state: SharedState,
+    stop_event: threading.Event,
+) -> None:
+    while not stop_event.is_set():
+        try:
+            print(
+                f"[BME280] Connecting at I2C address "
+                f"0x{BME280_ADDRESS:02X}"
+            )
+
+            i2c = board.I2C()
+
+            sensor = adafruit_bme280.Adafruit_BME280_I2C(
+                i2c,
+                address=BME280_ADDRESS,
+            )
+
+            print("[BME280] Connected")
+
+            with state.lock:
+                state.bme280_error = None
+
+            while not stop_event.is_set():
+                temperature_c = sensor.temperature
+                humidity_pct = sensor.relative_humidity
+                pressure_hpa = sensor.pressure
+
+                now = time.monotonic()
+
+                with state.lock:
+                    state.air_temperature_c = temperature_c
+                    state.relative_humidity_pct = humidity_pct
+                    state.air_pressure_hpa = pressure_hpa
+
+                    state.bme280_last_update = now
+                    state.bme280_error = None
+
+                stop_event.wait(1.0)
+
+        except Exception as exc:
+            error_text = f"{type(exc).__name__}: {exc}"
+
+            with state.lock:
+                state.bme280_error = error_text
+
+            print(f"[BME280] Disconnected: {error_text}")
+
+        if not stop_event.is_set():
+            print(
+                f"[BME280] Retrying in "
+                f"{RECONNECT_DELAY_S:.0f} seconds..."
+            )
+
+            stop_event.wait(RECONNECT_DELAY_S)
+
 def snapshot_state(state: SharedState) -> dict:
     now = time.monotonic()
 
@@ -371,6 +438,9 @@ def snapshot_state(state: SharedState) -> dict:
             "lidar_distance_m": state.lidar_distance_m,
             "lidar_strength": state.lidar_strength,
             "lidar_temperature_c": state.lidar_temperature_c,
+            "air_temperature_c": state.air_temperature_c,
+            "relative_humidity_pct": state.relative_humidity_pct,
+            "air_pressure_hpa": state.air_pressure_hpa,
             "pixhawk_age_s": age_seconds(
                 state.pixhawk_last_update,
                 now,
@@ -385,6 +455,10 @@ def snapshot_state(state: SharedState) -> dict:
             ),
             "lidar_age_s": age_seconds(
                 state.lidar_last_update,
+                now,
+            ),
+            "bme280_age_s": age_seconds(
+                state.bme280_last_update,
                 now,
             ),
         "pixhawk_status": (
@@ -425,9 +499,18 @@ def snapshot_state(state: SharedState) -> dict:
             if ENABLE_LIDAR
             else "DISABLED"
         ),
-
+        "bme280_status": (
+            health_status(
+                state.bme280_last_update,
+                BME280_STALE_S,
+                now,
+            )
+            if ENABLE_BME280
+            else "DISABLED"
+        ),
             "pixhawk_error": state.pixhawk_error,
             "lidar_error": state.lidar_error,
+            "bme280_error": state.bme280_error,
         }
 
 
@@ -462,7 +545,14 @@ def print_status(snapshot: dict) -> None:
         f"strength="
         f"{optional_text(snapshot['lidar_strength'])} "
         f"temperature="
-        f"{optional_text(snapshot['lidar_temperature_c'], 1)} C"
+        f"{optional_text(snapshot['lidar_temperature_c'], 1)} C\n"
+        f"BME280: {snapshot['bme280_status']:<8} "
+        f"air_temp="
+        f"{optional_text(snapshot['air_temperature_c'], 2)} C "
+        f"humidity="
+        f"{optional_text(snapshot['relative_humidity_pct'], 2)} % "
+        f"pressure="
+        f"{optional_text(snapshot['air_pressure_hpa'], 2)} hPa"
     )
 
 
@@ -525,6 +615,18 @@ def main() -> None:
     else:
         print("[LiDAR] Disabled by configuration")
      
+    if ENABLE_BME280:
+        bme280_thread = threading.Thread(
+            target=read_bme280,
+            args=(state, stop_event),
+            daemon=True,
+            name="bme280-reader",
+        )
+        bme280_thread.start()
+        threads.append(bme280_thread)
+    else:
+        print("[BME280] Disabled by configuration")
+
     last_print = 0.0
     last_log = 0.0
 
