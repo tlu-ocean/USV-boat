@@ -17,6 +17,7 @@ from pymavlink import mavutil
 ENABLE_PIXHAWK = True
 ENABLE_LIDAR = True
 ENABLE_BME280 = True
+ENABLE_DS18B20 = True
 
 # Serial configuration
 PIXHAWK_PORT = "/dev/serial0"
@@ -26,6 +27,8 @@ LIDAR_PORT = "/dev/ttyAMA3"
 LIDAR_BAUD = 115200
 
 BME280_ADDRESS = 0x76
+
+DS18B20_DEVICE_ID = "28-000000230f20"
 
 # Runtime configuration
 PRINT_INTERVAL_S = 1.0
@@ -37,6 +40,12 @@ GPS_STALE_S = 3.0
 RC_STALE_S = 3.0
 LIDAR_STALE_S = 1.0
 BME280_STALE_S = 3.0
+DS18B20_READ_INTERVAL_S = 1.0
+DS18B20_STALE_S = 3.0
+
+DS18B20_DEVICE_FILE = Path(
+    f"/sys/bus/w1/devices/{DS18B20_DEVICE_ID}/w1_slave"
+)
 
 PROJECT_DIR = Path.home() / "boat"
 DATA_DIR = PROJECT_DIR / "data"
@@ -76,15 +85,19 @@ class SharedState:
     relative_humidity_pct: Optional[float] = None
     air_pressure_hpa: Optional[float] = None
 
+    ds18b20_temperature_c: Optional[float] = None
+
     pixhawk_last_update: Optional[float] = None
     gps_last_update: Optional[float] = None
     rc_last_update: Optional[float] = None
     lidar_last_update: Optional[float] = None
     bme280_last_update: Optional[float] = None
-    
+    ds18b20_last_update: Optional[float] = None
+
     pixhawk_error: Optional[str] = None
     lidar_error: Optional[str] = None
     bme280_error: Optional[str] = None
+    ds18b20_error: Optional[str] = None
 
 def age_seconds(last_update: Optional[float], now: float) -> Optional[float]:
     if last_update is None:
@@ -411,6 +424,79 @@ def read_bme280(
 
             stop_event.wait(RECONNECT_DELAY_S)
 
+def read_ds18b20(
+    state: SharedState,
+    stop_event: threading.Event,
+) -> None:
+    while not stop_event.is_set():
+        try:
+            print(
+                f"[DS18B20] Connecting to {DS18B20_DEVICE_ID}"
+            )
+
+            if not DS18B20_DEVICE_FILE.exists():
+                raise FileNotFoundError(
+                    f"DS18B20 device file not found: "
+                    f"{DS18B20_DEVICE_FILE}"
+                )
+
+            print("[DS18B20] Connected")
+
+            with state.lock:
+                state.ds18b20_error = None
+
+            while not stop_event.is_set():
+                text = DS18B20_DEVICE_FILE.read_text()
+                lines = text.strip().splitlines()
+
+                if len(lines) < 2:
+                    raise RuntimeError(
+                        "Unexpected DS18B20 data format"
+                    )
+
+                if not lines[0].strip().endswith("YES"):
+                    raise RuntimeError(
+                        "DS18B20 CRC check failed"
+                    )
+
+                if "t=" not in lines[1]:
+                    raise RuntimeError(
+                        "DS18B20 temperature not found"
+                    )
+
+                temperature_milli_c = int(
+                    lines[1].split("t=")[1]
+                )
+
+                temperature_c = temperature_milli_c / 1000.0
+
+                now = time.monotonic()
+
+                with state.lock:
+                    state.ds18b20_temperature_c = temperature_c
+                    state.ds18b20_last_update = now
+                    state.ds18b20_error = None
+
+                stop_event.wait(DS18B20_READ_INTERVAL_S)
+
+        except Exception as exc:
+            error_text = f"{type(exc).__name__}: {exc}"
+
+            with state.lock:
+                state.ds18b20_error = error_text
+
+            print(
+                f"[DS18B20] Disconnected: {error_text}"
+            )
+
+        if not stop_event.is_set():
+            print(
+                f"[DS18B20] Retrying in "
+                f"{RECONNECT_DELAY_S:.0f} seconds..."
+            )
+
+            stop_event.wait(RECONNECT_DELAY_S)
+
 def snapshot_state(state: SharedState) -> dict:
     now = time.monotonic()
 
@@ -441,6 +527,7 @@ def snapshot_state(state: SharedState) -> dict:
             "air_temperature_c": state.air_temperature_c,
             "relative_humidity_pct": state.relative_humidity_pct,
             "air_pressure_hpa": state.air_pressure_hpa,
+            "ds18b20_temperature_c": state.ds18b20_temperature_c,
             "pixhawk_age_s": age_seconds(
                 state.pixhawk_last_update,
                 now,
@@ -459,6 +546,10 @@ def snapshot_state(state: SharedState) -> dict:
             ),
             "bme280_age_s": age_seconds(
                 state.bme280_last_update,
+                now,
+            ),
+            "ds18b20_age_s": age_seconds(
+                state.ds18b20_last_update,
                 now,
             ),
         "pixhawk_status": (
@@ -508,9 +599,19 @@ def snapshot_state(state: SharedState) -> dict:
             if ENABLE_BME280
             else "DISABLED"
         ),
+        "ds18b20_status": (
+            health_status(
+                state.ds18b20_last_update,
+                DS18B20_STALE_S,
+                now,
+            )
+            if ENABLE_DS18B20
+            else "DISABLED"
+        ),
             "pixhawk_error": state.pixhawk_error,
             "lidar_error": state.lidar_error,
             "bme280_error": state.bme280_error,
+            "ds18b20_error": state.ds18b20_error,
         }
 
 
@@ -552,7 +653,10 @@ def print_status(snapshot: dict) -> None:
         f"humidity="
         f"{optional_text(snapshot['relative_humidity_pct'], 2)} % "
         f"pressure="
-        f"{optional_text(snapshot['air_pressure_hpa'], 2)} hPa"
+        f"{optional_text(snapshot['air_pressure_hpa'], 2)} hPa\n"
+        f"DS18B20: {snapshot['ds18b20_status']:<8} "
+        f"temperature="
+        f"{optional_text(snapshot['ds18b20_temperature_c'], 3)} C"
     )
 
 
@@ -627,6 +731,20 @@ def main() -> None:
     else:
         print("[BME280] Disabled by configuration")
 
+    if ENABLE_DS18B20:
+        ds18b20_thread = threading.Thread(
+            target=read_ds18b20,
+            args=(state, stop_event),
+            daemon=True,
+            name="ds18b20-reader",
+        )
+
+        ds18b20_thread.start()
+        threads.append(ds18b20_thread)
+
+    else:
+        print("[DS18B20] Disabled by configuration")
+    
     last_print = 0.0
     last_log = 0.0
 
