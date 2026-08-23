@@ -1,270 +1,540 @@
 #!/usr/bin/env python3
 
+from __future__ import annotations
+
 import csv
+import math
 import threading
 import time
-from dataclasses import dataclass, field
-from datetime import datetime
+from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
 
 import serial
-import board
-import adafruit_bme280.basic as adafruit_bme280
+from pyais import decode
 from pymavlink import mavutil
 
-# Device enable switches
+import board
+import adafruit_bme280.basic as adafruit_bme280
+
+
+# ============================================================
+# Configuration
+# ============================================================
+
 ENABLE_PIXHAWK = True
 ENABLE_LIDAR = True
 ENABLE_BME280 = True
 ENABLE_DS18B20 = True
+ENABLE_AIS = True
 
-# Serial configuration
+
+# ---------------- Pixhawk ----------------
+
 PIXHAWK_PORT = "/dev/serial0"
 PIXHAWK_BAUD = 115200
+PIXHAWK_STALE_S = 3.0
+
+
+# ---------------- TFmini Plus ----------------
 
 LIDAR_PORT = "/dev/ttyAMA3"
 LIDAR_BAUD = 115200
+LIDAR_STALE_S = 2.0
+
+
+# ---------------- BME280 ----------------
 
 BME280_ADDRESS = 0x76
+BME280_READ_INTERVAL_S = 1.0
+BME280_STALE_S = 3.0
+
+
+# ---------------- DS18B20 ----------------
 
 DS18B20_DEVICE_ID = "28-000000230f20"
-
-# Runtime configuration
-PRINT_INTERVAL_S = 1.0
-LOG_INTERVAL_S = 0.5
-RECONNECT_DELAY_S = 5.0
-PIXHAWK_MESSAGE_TIMEOUT_S = 5.0
-PIXHAWK_STALE_S = 3.0
-GPS_STALE_S = 3.0
-RC_STALE_S = 3.0
-LIDAR_STALE_S = 1.0
-BME280_STALE_S = 3.0
+DS18B20_BASE_DIR = Path("/sys/bus/w1/devices")
 DS18B20_READ_INTERVAL_S = 1.0
 DS18B20_STALE_S = 3.0
 
-DS18B20_DEVICE_FILE = Path(
-    f"/sys/bus/w1/devices/{DS18B20_DEVICE_ID}/w1_slave"
-)
 
-PROJECT_DIR = Path.home() / "boat"
-DATA_DIR = PROJECT_DIR / "data"
-LOG_DIR = PROJECT_DIR / "logs"
+# ---------------- AIS / AR-10 ----------------
 
+# Stable path for the current CH340/CH341-based AR-10 receiver.
+AIS_PORT = "/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0"
+AIS_BAUD = 38400
+AIS_STALE_S = 10.0
+AIS_RECONNECT_DELAY_S = 5.0
+AIS_TARGET_ACTIVE_S = 60.0
+AIS_VESSEL_REMOVE_S = 300.0
+AIS_TABLE_MAX_ROWS = 12
+
+# If Pixhawk has no valid GPS fix, use this point only as a temporary
+# reference for distance/bearing calculations. It does NOT overwrite
+# Pixhawk GPS data and is always labeled FALLBACK in the display/log.
+USE_FALLBACK_POSITION = True
+FALLBACK_LAT = 29.313499
+FALLBACK_LON = -94.817141
+
+
+# ---------------- General ----------------
+
+RECONNECT_DELAY_S = 5.0
+MAIN_LOOP_INTERVAL_S = 1.0
+DATA_DIR = Path.home() / "boat" / "data"
+AIS_DATA_DIR = DATA_DIR / "ais"
+
+
+# ============================================================
+# Shared state
+# ============================================================
 
 @dataclass
 class SharedState:
-    lock: threading.Lock = field(default_factory=threading.Lock)
 
-    mode: str = "UNKNOWN"
-    armed: bool = False
+    # --------------------------------------------------------
+    # System
+    # --------------------------------------------------------
 
-    latitude: Optional[float] = None
-    longitude: Optional[float] = None
-    heading_deg: Optional[float] = None
-    ground_speed_mps: Optional[float] = None
+    timestamp: str | None = None
 
-    gps_fix_type: Optional[int] = None
-    satellites_visible: Optional[int] = None
+    # --------------------------------------------------------
+    # Pixhawk
+    # --------------------------------------------------------
 
-    battery_voltage_v: Optional[float] = None
-    battery_current_a: Optional[float] = None
-    battery_remaining_pct: Optional[int] = None
+    pixhawk_status: str = "NO_DATA"
+    pixhawk_error: str | None = None
+    pixhawk_last_update: float | None = None
 
-    rc_rssi: Optional[int] = None
-    rc_channel_1: Optional[int] = None
-    rc_channel_2: Optional[int] = None
-    rc_channel_3: Optional[int] = None
-    rc_channel_4: Optional[int] = None
+    flight_mode: str | None = None
+    armed: bool | None = None
 
-    lidar_distance_m: Optional[float] = None
-    lidar_strength: Optional[int] = None
-    lidar_temperature_c: Optional[float] = None
+    latitude_deg: float | None = None
+    longitude_deg: float | None = None
+    altitude_m: float | None = None
 
-    air_temperature_c: Optional[float] = None
-    relative_humidity_pct: Optional[float] = None
-    air_pressure_hpa: Optional[float] = None
+    gps_fix_type: int | None = None
+    gps_satellites: int | None = None
 
-    ds18b20_temperature_c: Optional[float] = None
+    heading_deg: float | None = None
+    ground_course_deg: float | None = None
+    ground_speed_mps: float | None = None
 
-    pixhawk_last_update: Optional[float] = None
-    gps_last_update: Optional[float] = None
-    rc_last_update: Optional[float] = None
-    lidar_last_update: Optional[float] = None
-    bme280_last_update: Optional[float] = None
-    ds18b20_last_update: Optional[float] = None
+    battery_voltage_v: float | None = None
+    battery_current_a: float | None = None
+    battery_remaining_pct: int | None = None
 
-    pixhawk_error: Optional[str] = None
-    lidar_error: Optional[str] = None
-    bme280_error: Optional[str] = None
-    ds18b20_error: Optional[str] = None
+    rc1: int | None = None
+    rc2: int | None = None
+    rc3: int | None = None
+    rc4: int | None = None
 
-def age_seconds(last_update: Optional[float], now: float) -> Optional[float]:
+    # --------------------------------------------------------
+    # TFmini Plus
+    # --------------------------------------------------------
+
+    lidar_status: str = "NO_DATA"
+    lidar_error: str | None = None
+    lidar_last_update: float | None = None
+
+    lidar_distance_m: float | None = None
+    lidar_strength: int | None = None
+    lidar_temperature_c: float | None = None
+
+    # --------------------------------------------------------
+    # BME280
+    # --------------------------------------------------------
+
+    bme280_status: str = "NO_DATA"
+    bme280_error: str | None = None
+    bme280_last_update: float | None = None
+
+    air_temperature_c: float | None = None
+    relative_humidity_pct: float | None = None
+    air_pressure_hpa: float | None = None
+
+    # --------------------------------------------------------
+    # DS18B20
+    # --------------------------------------------------------
+
+    ds18b20_status: str = "NO_DATA"
+    ds18b20_error: str | None = None
+    ds18b20_last_update: float | None = None
+
+    ds18b20_temperature_c: float | None = None
+
+    # --------------------------------------------------------
+    # AIS summary
+    # --------------------------------------------------------
+
+    ais_status: str = "NO_DATA"
+    ais_error: str | None = None
+    ais_last_update: float | None = None
+    ais_vessel_count: int = 0
+
+
+state = SharedState()
+state_lock = threading.Lock()
+
+# One entry per MMSI. Dynamic messages update the same row; static
+# messages fill in name/callsign/type/etc for that same MMSI.
+ais_vessels: dict[int, dict] = {}
+ais_lock = threading.Lock()
+
+# Multipart !AIVDM cache.
+ais_multipart: dict[tuple, dict] = {}
+
+
+# ============================================================
+# Utility functions
+# ============================================================
+
+def now_monotonic() -> float:
+    return time.monotonic()
+
+
+def wall_clock_timestamp() -> str:
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def age_seconds(last_update: float | None) -> float | None:
     if last_update is None:
         return None
-    return max(0.0, now - last_update)
+    return now_monotonic() - last_update
 
 
-def health_status(
-    last_update: Optional[float],
-    stale_after_s: float,
-    now: float,
+def status_from_age(
+    enabled: bool,
+    last_update: float | None,
+    stale_threshold_s: float,
 ) -> str:
-    age = age_seconds(last_update, now)
-
-    if age is None:
+    if not enabled:
+        return "DISABLED"
+    if last_update is None:
         return "NO_DATA"
 
-    if age > stale_after_s:
+    age = age_seconds(last_update)
+    if age is not None and age > stale_threshold_s:
         return "STALE"
 
     return "OK"
 
 
-def optional_text(value, decimals: int = 2) -> str:
+def fmt(value, decimals=2):
     if value is None:
-        return "N/A"
-
+        return "--"
     if isinstance(value, float):
         return f"{value:.{decimals}f}"
-
     return str(value)
 
 
-def read_pixhawk(
-    state: SharedState,
-    stop_event: threading.Event,
-) -> None:
-    while not stop_event.is_set():
+def valid_pixhawk_position(
+    lat: float | None,
+    lon: float | None,
+    fix_type: int | None,
+) -> bool:
+    if fix_type is None or fix_type < 2:
+        return False
+    if lat is None or lon is None:
+        return False
+    if not (-90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0):
+        return False
+    if abs(lat) < 1e-9 and abs(lon) < 1e-9:
+        return False
+    return True
+
+
+def get_own_position(snapshot: dict) -> tuple[float | None, float | None, str]:
+    lat = snapshot.get("latitude_deg")
+    lon = snapshot.get("longitude_deg")
+    fix_type = snapshot.get("gps_fix_type")
+
+    if valid_pixhawk_position(lat, lon, fix_type):
+        return lat, lon, "PIXHAWK"
+
+    if USE_FALLBACK_POSITION:
+        return FALLBACK_LAT, FALLBACK_LON, "FALLBACK"
+
+    return None, None, "UNAVAILABLE"
+
+
+def distance_and_bearing(
+    lat1_deg: float,
+    lon1_deg: float,
+    lat2_deg: float,
+    lon2_deg: float,
+) -> tuple[float, float]:
+    """Return great-circle distance in meters and initial bearing in degrees."""
+
+    earth_radius_m = 6371000.0
+
+    lat1 = math.radians(lat1_deg)
+    lon1 = math.radians(lon1_deg)
+    lat2 = math.radians(lat2_deg)
+    lon2 = math.radians(lon2_deg)
+
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+
+    a = (
+        math.sin(dlat / 2.0) ** 2
+        + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2.0) ** 2
+    )
+    c = 2.0 * math.atan2(math.sqrt(a), math.sqrt(1.0 - a))
+    distance_m = earth_radius_m * c
+
+    y = math.sin(dlon) * math.cos(lat2)
+    x = (
+        math.cos(lat1) * math.sin(lat2)
+        - math.sin(lat1) * math.cos(lat2) * math.cos(dlon)
+    )
+    bearing_deg = (math.degrees(math.atan2(y, x)) + 360.0) % 360.0
+
+    return distance_m, bearing_deg
+
+
+def signed_angle_deg(angle_deg: float) -> float:
+    """Normalize an angle to [-180, 180)."""
+    return (angle_deg + 180.0) % 360.0 - 180.0
+
+
+def relative_bearing_deg(
+    target_bearing_deg: float | None,
+    own_heading_deg: float | None,
+) -> float | None:
+    """
+    Relative bearing from own bow to the target.
+
+    0 = straight ahead
+    +90 = starboard/right
+    -90 = port/left
+    +/-180 = directly astern
+    """
+    if target_bearing_deg is None or own_heading_deg is None:
+        return None
+    return signed_angle_deg(target_bearing_deg - own_heading_deg)
+
+
+def velocity_components_mps(
+    speed_mps: float,
+    course_deg: float,
+) -> tuple[float, float]:
+    """Return east, north velocity components from SOG/course."""
+    angle = math.radians(course_deg)
+    east = speed_mps * math.sin(angle)
+    north = speed_mps * math.cos(angle)
+    return east, north
+
+
+def cpa_tcpa(
+    distance_m: float | None,
+    bearing_deg: float | None,
+    own_speed_mps: float | None,
+    own_course_deg: float | None,
+    target_speed_knots: float | None,
+    target_course_deg: float | None,
+) -> tuple[float | None, float | None]:
+    """
+    Constant-velocity Closest Point of Approach calculation.
+
+    Returns:
+        cpa_m: separation distance at closest approach
+        tcpa_s: signed time to CPA in seconds
+                > 0 means closest approach is in the future
+                < 0 means the mathematical CPA was in the past
+    """
+    values = (
+        distance_m,
+        bearing_deg,
+        own_speed_mps,
+        own_course_deg,
+        target_speed_knots,
+        target_course_deg,
+    )
+    if any(value is None for value in values):
+        return None, None
+
+    bearing = math.radians(float(bearing_deg))
+    rel_east = float(distance_m) * math.sin(bearing)
+    rel_north = float(distance_m) * math.cos(bearing)
+
+    own_east, own_north = velocity_components_mps(
+        float(own_speed_mps),
+        float(own_course_deg),
+    )
+    target_east, target_north = velocity_components_mps(
+        float(target_speed_knots) * 0.514444,
+        float(target_course_deg),
+    )
+
+    rel_vel_east = target_east - own_east
+    rel_vel_north = target_north - own_north
+    rel_speed_sq = rel_vel_east ** 2 + rel_vel_north ** 2
+
+    # If relative speed is essentially zero, CPA is simply current range
+    # and there is no meaningful finite TCPA.
+    if rel_speed_sq < 1e-6:
+        return float(distance_m), None
+
+    tcpa_s = -(
+        rel_east * rel_vel_east
+        + rel_north * rel_vel_north
+    ) / rel_speed_sq
+
+    cpa_east = rel_east + rel_vel_east * tcpa_s
+    cpa_north = rel_north + rel_vel_north * tcpa_s
+    cpa_m = math.hypot(cpa_east, cpa_north)
+
+    return cpa_m, tcpa_s
+
+
+# ============================================================
+# Pixhawk reader
+# ============================================================
+
+def read_pixhawk() -> None:
+    if not ENABLE_PIXHAWK:
+        with state_lock:
+            state.pixhawk_status = "DISABLED"
+        return
+
+    while True:
         connection = None
 
         try:
-            print(
-                f"[Pixhawk] Connecting to {PIXHAWK_PORT} "
-                f"at {PIXHAWK_BAUD} baud"
-            )
+            print(f"[Pixhawk] Connecting to {PIXHAWK_PORT} @ {PIXHAWK_BAUD}")
 
             connection = mavutil.mavlink_connection(
                 PIXHAWK_PORT,
                 baud=PIXHAWK_BAUD,
-                source_system=255,
             )
 
-            heartbeat = connection.wait_heartbeat(timeout=15)
+            connection.wait_heartbeat(timeout=10)
 
             print(
-                "[Pixhawk] Connected:",
-                f"system={connection.target_system}",
-                f"component={connection.target_component}",
-                f"vehicle_type={heartbeat.type}",
+                "[Pixhawk] Heartbeat received "
+                f"system={connection.target_system} "
+                f"component={connection.target_component}"
             )
 
-            last_message_time = time.monotonic()
-
-            with state.lock:
+            with state_lock:
                 state.pixhawk_error = None
 
-            while not stop_event.is_set():
-                message = connection.recv_match(
+            while True:
+                msg = connection.recv_match(
                     blocking=True,
                     timeout=1,
                 )
 
-                if message is None:
-                    no_message_age = (
-                        time.monotonic() - last_message_time
+                if msg is None:
+                    continue
+
+                msg_type = msg.get_type()
+                now = now_monotonic()
+
+                if msg_type == "HEARTBEAT":
+                    try:
+                        mode = mavutil.mode_string_v10(msg)
+                    except Exception:
+                        mode = None
+
+                    armed = bool(
+                        msg.base_mode
+                        & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED
                     )
 
-                    if no_message_age > PIXHAWK_MESSAGE_TIMEOUT_S:
-                        raise ConnectionError(
-                            "No MAVLink message received for "
-                            f"{no_message_age:.1f} seconds"
-                        )
+                    with state_lock:
+                        state.flight_mode = mode
+                        state.armed = armed
+                        state.pixhawk_last_update = now
+                        state.pixhawk_error = None
 
-                    continue
+                elif msg_type == "GPS_RAW_INT":
+                    latitude = msg.lat / 1e7
+                    longitude = msg.lon / 1e7
+                    altitude_m = msg.alt / 1000.0
 
-                message_type = message.get_type()
+                    with state_lock:
+                        state.latitude_deg = latitude
+                        state.longitude_deg = longitude
+                        state.altitude_m = altitude_m
+                        state.gps_fix_type = msg.fix_type
+                        state.gps_satellites = msg.satellites_visible
+                        state.pixhawk_last_update = now
+                        state.pixhawk_error = None
 
-                if message_type == "BAD_DATA":
-                    continue
+                elif msg_type == "GLOBAL_POSITION_INT":
+                    heading_deg = None
 
-                now = time.monotonic()
-                last_message_time = now
+                    if msg.hdg != 65535:
+                        heading_deg = msg.hdg / 100.0
 
-                with state.lock:
-                    state.pixhawk_last_update = now
-                    state.pixhawk_error = None
+                    ground_speed_mps = (
+                        (msg.vx ** 2 + msg.vy ** 2) ** 0.5
+                        / 100.0
+                    )
 
-                    if message_type == "HEARTBEAT":
-                        state.mode = mavutil.mode_string_v10(message)
-                        state.armed = bool(
-                            message.base_mode
-                            & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED
-                        )
+                    ground_course_deg = None
+                    if ground_speed_mps > 0.05:
+                        # MAVLink GLOBAL_POSITION_INT uses vx=north, vy=east.
+                        ground_course_deg = (
+                            math.degrees(math.atan2(msg.vy, msg.vx)) + 360.0
+                        ) % 360.0
 
-                    elif message_type == "GLOBAL_POSITION_INT":
-                        state.latitude = message.lat / 1e7
-                        state.longitude = message.lon / 1e7
+                    with state_lock:
+                        # Do not let GLOBAL_POSITION_INT replace a known invalid
+                        # GPS_RAW_INT fix with an apparently valid-looking position
+                        # for own-ship selection; get_own_position() still requires
+                        # gps_fix_type >= 2.
+                        state.latitude_deg = msg.lat / 1e7
+                        state.longitude_deg = msg.lon / 1e7
+                        state.heading_deg = heading_deg
+                        state.ground_course_deg = ground_course_deg
+                        state.ground_speed_mps = ground_speed_mps
+                        state.pixhawk_last_update = now
+                        state.pixhawk_error = None
 
-                        state.heading_deg = (
-                            None
-                            if message.hdg == 65535
-                            else message.hdg / 100.0
-                        )
+                elif msg_type == "VFR_HUD":
+                    with state_lock:
+                        state.heading_deg = float(msg.heading)
+                        state.ground_speed_mps = float(msg.groundspeed)
+                        state.pixhawk_last_update = now
+                        state.pixhawk_error = None
 
-                        state.gps_last_update = now
+                elif msg_type == "SYS_STATUS":
+                    voltage_v = None
+                    current_a = None
+                    remaining = None
 
-                    elif message_type == "GPS_RAW_INT":
-                        state.gps_fix_type = message.fix_type
+                    if msg.voltage_battery != 65535:
+                        voltage_v = msg.voltage_battery / 1000.0
 
-                        state.satellites_visible = (
-                            None
-                            if message.satellites_visible == 255
-                            else message.satellites_visible
-                        )
+                    if msg.current_battery != -1:
+                        current_a = msg.current_battery / 100.0
 
-                        state.gps_last_update = now
+                    if msg.battery_remaining != -1:
+                        remaining = int(msg.battery_remaining)
 
-                    elif message_type == "VFR_HUD":
-                        state.ground_speed_mps = message.groundspeed
+                    with state_lock:
+                        state.battery_voltage_v = voltage_v
+                        state.battery_current_a = current_a
+                        state.battery_remaining_pct = remaining
+                        state.pixhawk_last_update = now
+                        state.pixhawk_error = None
 
-                    elif message_type == "SYS_STATUS":
-                        state.battery_voltage_v = (
-                            None
-                            if message.voltage_battery == 65535
-                            else message.voltage_battery / 1000.0
-                        )
-
-                        state.battery_current_a = (
-                            None
-                            if message.current_battery == -1
-                            else message.current_battery / 100.0
-                        )
-
-                        state.battery_remaining_pct = (
-                            None
-                            if message.battery_remaining == -1
-                            else message.battery_remaining
-                        )
-
-                    elif message_type == "RC_CHANNELS":
-                        state.rc_rssi = (
-                            None if message.rssi == 255 else message.rssi
-                        )
-
-                        state.rc_channel_1 = message.chan1_raw
-                        state.rc_channel_2 = message.chan2_raw
-                        state.rc_channel_3 = message.chan3_raw
-                        state.rc_channel_4 = message.chan4_raw
-                        state.rc_last_update = now
+                elif msg_type == "RC_CHANNELS":
+                    with state_lock:
+                        state.rc1 = msg.chan1_raw
+                        state.rc2 = msg.chan2_raw
+                        state.rc3 = msg.chan3_raw
+                        state.rc4 = msg.chan4_raw
+                        state.pixhawk_last_update = now
+                        state.pixhawk_error = None
 
         except Exception as exc:
-            error_text = f"{type(exc).__name__}: {exc}"
-
-            with state.lock:
-                state.pixhawk_error = error_text
-
-            print(f"[Pixhawk] Disconnected: {error_text}")
+            print(f"[Pixhawk] ERROR: {exc}")
+            with state_lock:
+                state.pixhawk_error = str(exc)
 
         finally:
             if connection is not None:
@@ -273,110 +543,134 @@ def read_pixhawk(
                 except Exception:
                     pass
 
-        if not stop_event.is_set():
-            print(
-                f"[Pixhawk] Retrying in "
-                f"{RECONNECT_DELAY_S:.0f} seconds..."
-            )
-            stop_event.wait(RECONNECT_DELAY_S)
+        print(f"[Pixhawk] Reconnecting in {RECONNECT_DELAY_S:.0f} s...")
+        time.sleep(RECONNECT_DELAY_S)
 
 
-def read_lidar(
-    state: SharedState,
-    stop_event: threading.Event,
-) -> None:
-    while not stop_event.is_set():
+# ============================================================
+# TFmini Plus reader
+# ============================================================
+
+def parse_tfmini_frame(frame: bytes):
+    if len(frame) != 9:
+        return None
+    if frame[0] != 0x59 or frame[1] != 0x59:
+        return None
+
+    checksum = sum(frame[:8]) & 0xFF
+    if checksum != frame[8]:
+        return None
+
+    distance_cm = frame[2] | (frame[3] << 8)
+    strength = frame[4] | (frame[5] << 8)
+    temperature_raw = frame[6] | (frame[7] << 8)
+    temperature_c = temperature_raw / 8.0 - 256.0
+
+    return (
+        distance_cm / 100.0,
+        strength,
+        temperature_c,
+    )
+
+
+def read_lidar() -> None:
+    if not ENABLE_LIDAR:
+        with state_lock:
+            state.lidar_status = "DISABLED"
+        return
+
+    while True:
+        ser = None
+
         try:
-            print(
-                f"[LiDAR] Connecting to {LIDAR_PORT} "
-                f"at {LIDAR_BAUD} baud"
-            )
+            print(f"[LiDAR] Opening {LIDAR_PORT} @ {LIDAR_BAUD}")
 
-            with serial.Serial(
+            ser = serial.Serial(
                 LIDAR_PORT,
                 LIDAR_BAUD,
-                timeout=0.5,
-            ) as lidar:
-                print("[LiDAR] Connected")
+                timeout=1,
+            )
 
-                with state.lock:
-                    state.lidar_error = None
+            ser.reset_input_buffer()
+            print("[LiDAR] Connected")
 
-                while not stop_event.is_set():
-                    first = lidar.read(1)
+            with state_lock:
+                state.lidar_error = None
 
-                    if first != b"\x59":
+            buffer = bytearray()
+
+            while True:
+                chunk = ser.read(64)
+                if not chunk:
+                    continue
+
+                buffer.extend(chunk)
+
+                while len(buffer) >= 9:
+                    header_index = buffer.find(b"\x59\x59")
+
+                    if header_index < 0:
+                        if buffer[-1:] == b"\x59":
+                            buffer[:] = buffer[-1:]
+                        else:
+                            buffer.clear()
+                        break
+
+                    if header_index > 0:
+                        del buffer[:header_index]
+
+                    if len(buffer) < 9:
+                        break
+
+                    frame = bytes(buffer[:9])
+                    parsed = parse_tfmini_frame(frame)
+
+                    if parsed is None:
+                        del buffer[0]
                         continue
 
-                    second = lidar.read(1)
+                    del buffer[:9]
 
-                    if second != b"\x59":
-                        continue
+                    distance_m, strength, temperature_c = parsed
 
-                    payload = lidar.read(7)
-
-                    if len(payload) != 7:
-                        continue
-
-                    frame = b"\x59\x59" + payload
-
-                    checksum = sum(frame[:8]) & 0xFF
-
-                    if checksum != frame[8]:
-                        continue
-
-                    distance_cm = frame[2] | (frame[3] << 8)
-                    strength = frame[4] | (frame[5] << 8)
-
-                    temperature_raw = (
-                        frame[6] | (frame[7] << 8)
-                    )
-
-                    now = time.monotonic()
-
-                    with state.lock:
-                        state.lidar_distance_m = (
-                            distance_cm / 100.0
-                        )
+                    with state_lock:
+                        state.lidar_distance_m = distance_m
                         state.lidar_strength = strength
-                        state.lidar_temperature_c = (
-                            temperature_raw / 8.0 - 256.0
-                        )
-                        state.lidar_last_update = now
+                        state.lidar_temperature_c = temperature_c
+                        state.lidar_last_update = now_monotonic()
                         state.lidar_error = None
 
-        except (serial.SerialException, OSError) as exc:
-            error_text = f"{type(exc).__name__}: {exc}"
-
-            with state.lock:
-                state.lidar_error = error_text
-
-            print(f"[LiDAR] Disconnected: {error_text}")
-
         except Exception as exc:
-            error_text = f"{type(exc).__name__}: {exc}"
+            print(f"[LiDAR] ERROR: {exc}")
+            with state_lock:
+                state.lidar_error = str(exc)
 
-            with state.lock:
-                state.lidar_error = error_text
+        finally:
+            if ser is not None:
+                try:
+                    ser.close()
+                except Exception:
+                    pass
 
-            print(f"[LiDAR] Unexpected error: {error_text}")
+        print(f"[LiDAR] Reconnecting in {RECONNECT_DELAY_S:.0f} s...")
+        time.sleep(RECONNECT_DELAY_S)
 
-        if not stop_event.is_set():
-            print(
-                f"[LiDAR] Retrying in "
-                f"{RECONNECT_DELAY_S:.0f} seconds..."
-            )
-            stop_event.wait(RECONNECT_DELAY_S)
 
-def read_bme280(
-    state: SharedState,
-    stop_event: threading.Event,
-) -> None:
-    while not stop_event.is_set():
+# ============================================================
+# BME280 reader
+# ============================================================
+
+def read_bme280() -> None:
+    if not ENABLE_BME280:
+        with state_lock:
+            state.bme280_status = "DISABLED"
+        return
+
+    while True:
         try:
             print(
-                f"[BME280] Connecting at I2C address "
-                f"0x{BME280_ADDRESS:02X}"
+                f"[BME280] Connecting on I2C "
+                f"address 0x{BME280_ADDRESS:02X}"
             )
 
             i2c = board.I2C()
@@ -388,394 +682,837 @@ def read_bme280(
 
             print("[BME280] Connected")
 
-            with state.lock:
+            with state_lock:
                 state.bme280_error = None
 
-            while not stop_event.is_set():
-                temperature_c = sensor.temperature
-                humidity_pct = sensor.relative_humidity
-                pressure_hpa = sensor.pressure
+            while True:
+                temperature_c = float(sensor.temperature)
+                humidity_pct = float(sensor.relative_humidity)
+                pressure_hpa = float(sensor.pressure)
 
-                now = time.monotonic()
-
-                with state.lock:
+                with state_lock:
                     state.air_temperature_c = temperature_c
                     state.relative_humidity_pct = humidity_pct
                     state.air_pressure_hpa = pressure_hpa
-
-                    state.bme280_last_update = now
+                    state.bme280_last_update = now_monotonic()
                     state.bme280_error = None
 
-                stop_event.wait(1.0)
+                time.sleep(BME280_READ_INTERVAL_S)
 
         except Exception as exc:
-            error_text = f"{type(exc).__name__}: {exc}"
+            print(f"[BME280] ERROR: {exc}")
+            with state_lock:
+                state.bme280_error = str(exc)
 
-            with state.lock:
-                state.bme280_error = error_text
+        print(f"[BME280] Reconnecting in {RECONNECT_DELAY_S:.0f} s...")
+        time.sleep(RECONNECT_DELAY_S)
 
-            print(f"[BME280] Disconnected: {error_text}")
 
-        if not stop_event.is_set():
-            print(
-                f"[BME280] Retrying in "
-                f"{RECONNECT_DELAY_S:.0f} seconds..."
-            )
+# ============================================================
+# DS18B20 reader
+# ============================================================
 
-            stop_event.wait(RECONNECT_DELAY_S)
+def get_ds18b20_file() -> Path:
+    return DS18B20_BASE_DIR / DS18B20_DEVICE_ID / "w1_slave"
 
-def read_ds18b20(
-    state: SharedState,
-    stop_event: threading.Event,
-) -> None:
-    while not stop_event.is_set():
+
+def read_ds18b20_temperature() -> float:
+    sensor_file = get_ds18b20_file()
+    text = sensor_file.read_text()
+    lines = text.strip().splitlines()
+
+    if len(lines) < 2:
+        raise RuntimeError("Unexpected DS18B20 data format")
+
+    if not lines[0].strip().endswith("YES"):
+        raise RuntimeError("DS18B20 CRC check failed")
+
+    marker = "t="
+    position = lines[1].find(marker)
+
+    if position < 0:
+        raise RuntimeError("DS18B20 temperature field not found")
+
+    temperature_mdeg = int(lines[1][position + len(marker):])
+    return temperature_mdeg / 1000.0
+
+
+def read_ds18b20() -> None:
+    if not ENABLE_DS18B20:
+        with state_lock:
+            state.ds18b20_status = "DISABLED"
+        return
+
+    while True:
         try:
-            print(
-                f"[DS18B20] Connecting to {DS18B20_DEVICE_ID}"
-            )
+            sensor_file = get_ds18b20_file()
+            print(f"[DS18B20] Looking for {sensor_file}")
 
-            if not DS18B20_DEVICE_FILE.exists():
+            if not sensor_file.exists():
                 raise FileNotFoundError(
-                    f"DS18B20 device file not found: "
-                    f"{DS18B20_DEVICE_FILE}"
+                    f"DS18B20 not found: {DS18B20_DEVICE_ID}"
                 )
 
-            print("[DS18B20] Connected")
+            print(f"[DS18B20] Connected {DS18B20_DEVICE_ID}")
 
-            with state.lock:
+            with state_lock:
                 state.ds18b20_error = None
 
-            while not stop_event.is_set():
-                text = DS18B20_DEVICE_FILE.read_text()
-                lines = text.strip().splitlines()
+            while True:
+                temperature_c = read_ds18b20_temperature()
 
-                if len(lines) < 2:
-                    raise RuntimeError(
-                        "Unexpected DS18B20 data format"
-                    )
-
-                if not lines[0].strip().endswith("YES"):
-                    raise RuntimeError(
-                        "DS18B20 CRC check failed"
-                    )
-
-                if "t=" not in lines[1]:
-                    raise RuntimeError(
-                        "DS18B20 temperature not found"
-                    )
-
-                temperature_milli_c = int(
-                    lines[1].split("t=")[1]
-                )
-
-                temperature_c = temperature_milli_c / 1000.0
-
-                now = time.monotonic()
-
-                with state.lock:
+                with state_lock:
                     state.ds18b20_temperature_c = temperature_c
-                    state.ds18b20_last_update = now
+                    state.ds18b20_last_update = now_monotonic()
                     state.ds18b20_error = None
 
-                stop_event.wait(DS18B20_READ_INTERVAL_S)
+                time.sleep(DS18B20_READ_INTERVAL_S)
 
         except Exception as exc:
-            error_text = f"{type(exc).__name__}: {exc}"
+            print(f"[DS18B20] ERROR: {exc}")
+            with state_lock:
+                state.ds18b20_error = str(exc)
 
-            with state.lock:
-                state.ds18b20_error = error_text
+        print(f"[DS18B20] Reconnecting in {RECONNECT_DELAY_S:.0f} s...")
+        time.sleep(RECONNECT_DELAY_S)
 
-            print(
-                f"[DS18B20] Disconnected: {error_text}"
+
+# ============================================================
+# AIS helpers
+# ============================================================
+
+def clean_ais_text(value):
+    if value is None:
+        return None
+    text = str(value).replace("@", "").strip()
+    return text or None
+
+
+def clean_ais_heading(value):
+    # AIS 511 means heading unavailable.
+    if value is None:
+        return None
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return None
+    return value if 0.0 <= value <= 359.0 else None
+
+
+def clean_ais_course(value):
+    # AIS 360.0 means COG unavailable.
+    if value is None:
+        return None
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return None
+    return value if 0.0 <= value < 360.0 else None
+
+
+def clean_ais_speed(value):
+    # AIS 102.3 kn means SOG unavailable.
+    if value is None:
+        return None
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return None
+    return value if 0.0 <= value < 102.3 else None
+
+
+def clean_ais_position(lat, lon):
+    if lat is None or lon is None:
+        return None, None
+
+    try:
+        lat = float(lat)
+        lon = float(lon)
+    except (TypeError, ValueError):
+        return None, None
+
+    if not (-90.0 <= lat <= 90.0):
+        return None, None
+    if not (-180.0 <= lon <= 180.0):
+        return None, None
+
+    return lat, lon
+
+
+def new_ais_vessel(mmsi: int) -> dict:
+    return {
+        "mmsi": mmsi,
+        "lat": None,
+        "lon": None,
+        "speed_knots": None,
+        "course_deg": None,
+        "heading_deg": None,
+        "rot": None,
+        "nav_status": None,
+        "name": None,
+        "callsign": None,
+        "imo": None,
+        "ship_type": None,
+        "destination": None,
+        "draught_m": None,
+        "to_bow_m": None,
+        "to_stern_m": None,
+        "to_port_m": None,
+        "to_starboard_m": None,
+        "last_msg_type": None,
+        "last_seen_monotonic": None,
+        "last_position_monotonic": None,
+    }
+
+
+def ais_history_file() -> Path:
+    AIS_DATA_DIR.mkdir(parents=True, exist_ok=True)
+    return AIS_DATA_DIR / f"ais_{datetime.now().strftime('%Y%m%d')}.csv"
+
+
+def log_ais_position(msg_type: int, vessel: dict) -> None:
+    path = ais_history_file()
+    file_exists = path.exists()
+
+    with path.open("a", newline="", buffering=1) as f:
+        writer = csv.writer(f)
+
+        if not file_exists:
+            writer.writerow([
+                "timestamp_utc",
+                "msg_type",
+                "mmsi",
+                "lat",
+                "lon",
+                "speed_knots",
+                "course_deg",
+                "heading_deg",
+            ])
+
+        writer.writerow([
+            datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            msg_type,
+            vessel["mmsi"],
+            vessel["lat"],
+            vessel["lon"],
+            vessel["speed_knots"],
+            vessel["course_deg"],
+            vessel["heading_deg"],
+        ])
+
+
+def process_ais_message(msg) -> None:
+    data = msg.asdict()
+    msg_type = data.get("msg_type")
+    mmsi = data.get("mmsi")
+
+    if mmsi is None:
+        return
+
+    try:
+        mmsi = int(mmsi)
+    except (TypeError, ValueError):
+        return
+
+    now = now_monotonic()
+
+    with ais_lock:
+        vessel = ais_vessels.setdefault(mmsi, new_ais_vessel(mmsi))
+        vessel["last_seen_monotonic"] = now
+        vessel["last_msg_type"] = msg_type
+
+        # Class A dynamic: 1/2/3
+        # Class B dynamic: 18/19
+        if msg_type in {1, 2, 3, 18, 19}:
+            lat, lon = clean_ais_position(
+                data.get("lat"),
+                data.get("lon"),
             )
 
-        if not stop_event.is_set():
-            print(
-                f"[DS18B20] Retrying in "
-                f"{RECONNECT_DELAY_S:.0f} seconds..."
-            )
+            if lat is not None and lon is not None:
+                vessel["lat"] = lat
+                vessel["lon"] = lon
+                vessel["last_position_monotonic"] = now
 
-            stop_event.wait(RECONNECT_DELAY_S)
+            vessel["speed_knots"] = clean_ais_speed(data.get("speed"))
+            vessel["course_deg"] = clean_ais_course(data.get("course"))
+            vessel["heading_deg"] = clean_ais_heading(data.get("heading"))
+            vessel["rot"] = data.get("turn")
+            vessel["nav_status"] = data.get("status")
 
-def snapshot_state(state: SharedState) -> dict:
-    now = time.monotonic()
+            if vessel["lat"] is not None and vessel["lon"] is not None:
+                log_ais_position(msg_type, vessel.copy())
 
-    with state.lock:
-        return {
-            "timestamp": datetime.now().astimezone().isoformat(
-                timespec="milliseconds"
-            ),
-            "mode": state.mode,
-            "armed": state.armed,
-            "latitude": state.latitude,
-            "longitude": state.longitude,
-            "heading_deg": state.heading_deg,
-            "ground_speed_mps": state.ground_speed_mps,
-            "gps_fix_type": state.gps_fix_type,
-            "satellites_visible": state.satellites_visible,
-            "battery_voltage_v": state.battery_voltage_v,
-            "battery_current_a": state.battery_current_a,
-            "battery_remaining_pct": state.battery_remaining_pct,
-            "rc_rssi": state.rc_rssi,
-            "rc_channel_1": state.rc_channel_1,
-            "rc_channel_2": state.rc_channel_2,
-            "rc_channel_3": state.rc_channel_3,
-            "rc_channel_4": state.rc_channel_4,
-            "lidar_distance_m": state.lidar_distance_m,
-            "lidar_strength": state.lidar_strength,
-            "lidar_temperature_c": state.lidar_temperature_c,
-            "air_temperature_c": state.air_temperature_c,
-            "relative_humidity_pct": state.relative_humidity_pct,
-            "air_pressure_hpa": state.air_pressure_hpa,
-            "ds18b20_temperature_c": state.ds18b20_temperature_c,
-            "pixhawk_age_s": age_seconds(
-                state.pixhawk_last_update,
-                now,
-            ),
-            "gps_age_s": age_seconds(
-                state.gps_last_update,
-                now,
-            ),
-            "rc_age_s": age_seconds(
-                state.rc_last_update,
-                now,
-            ),
-            "lidar_age_s": age_seconds(
-                state.lidar_last_update,
-                now,
-            ),
-            "bme280_age_s": age_seconds(
-                state.bme280_last_update,
-                now,
-            ),
-            "ds18b20_age_s": age_seconds(
-                state.ds18b20_last_update,
-                now,
-            ),
-        "pixhawk_status": (
-        health_status(
- 		    state.pixhawk_last_update,
-       		    PIXHAWK_STALE_S,
-        	    now,
-    	    	)
-    	    	if ENABLE_PIXHAWK
-     	    	else "DISABLED"
-        ),
-        "gps_status": (
-            health_status(
-                state.gps_last_update,
-                GPS_STALE_S,
-                now,
-            )
-            if ENABLE_PIXHAWK
-            else "DISABLED"
-        ),
+        # Class A static/voyage
+        elif msg_type == 5:
+            vessel["name"] = clean_ais_text(data.get("shipname"))
+            vessel["callsign"] = clean_ais_text(data.get("callsign"))
+            vessel["imo"] = data.get("imo")
+            vessel["ship_type"] = data.get("ship_type")
+            vessel["destination"] = clean_ais_text(data.get("destination"))
+            vessel["draught_m"] = data.get("draught")
+            vessel["to_bow_m"] = data.get("to_bow")
+            vessel["to_stern_m"] = data.get("to_stern")
+            vessel["to_port_m"] = data.get("to_port")
+            vessel["to_starboard_m"] = data.get("to_starboard")
 
-        "rc_status": (
-            health_status(
-                state.rc_last_update,
-                RC_STALE_S,
-                now,
-            )
-            if ENABLE_PIXHAWK
-            else "DISABLED"
-        ),
+        # Class B static (part A / part B)
+        elif msg_type == 24:
+            name = clean_ais_text(data.get("shipname"))
+            callsign = clean_ais_text(data.get("callsign"))
 
-        "lidar_status": (
-            health_status(
-                state.lidar_last_update,
-                LIDAR_STALE_S,
-                now,
-            )
-            if ENABLE_LIDAR
-            else "DISABLED"
-        ),
-        "bme280_status": (
-            health_status(
-                state.bme280_last_update,
-                BME280_STALE_S,
-                now,
-            )
-            if ENABLE_BME280
-            else "DISABLED"
-        ),
-        "ds18b20_status": (
-            health_status(
-                state.ds18b20_last_update,
-                DS18B20_STALE_S,
-                now,
-            )
-            if ENABLE_DS18B20
-            else "DISABLED"
-        ),
-            "pixhawk_error": state.pixhawk_error,
-            "lidar_error": state.lidar_error,
-            "bme280_error": state.bme280_error,
-            "ds18b20_error": state.ds18b20_error,
-        }
+            if name:
+                vessel["name"] = name
+            if callsign:
+                vessel["callsign"] = callsign
+            if data.get("ship_type") is not None:
+                vessel["ship_type"] = data.get("ship_type")
+
+            field_map = {
+                "to_bow": "to_bow_m",
+                "to_stern": "to_stern_m",
+                "to_port": "to_port_m",
+                "to_starboard": "to_starboard_m",
+            }
+
+            for source, target in field_map.items():
+                if data.get(source) is not None:
+                    vessel[target] = data.get(source)
+
+    with state_lock:
+        state.ais_last_update = now
+        state.ais_error = None
+        state.ais_vessel_count = len(ais_vessels)
 
 
-def print_status(snapshot: dict) -> None:
-    print(
-        "\n"
-        f"[{snapshot['timestamp']}]\n"
-        f"Pixhawk: {snapshot['pixhawk_status']:<8} "
-        f"Mode={snapshot['mode']:<10} "
-        f"Armed={snapshot['armed']}\n"
-        f"GPS: {snapshot['gps_status']:<8} "
-        f"fix={optional_text(snapshot['gps_fix_type'])} "
-        f"sats={optional_text(snapshot['satellites_visible'])} "
-        f"lat={optional_text(snapshot['latitude'], 7)} "
-        f"lon={optional_text(snapshot['longitude'], 7)}\n"
-        f"Motion: heading="
-        f"{optional_text(snapshot['heading_deg'], 1)} deg "
-        f"speed={optional_text(snapshot['ground_speed_mps'], 2)} m/s\n"
-        f"RC: {snapshot['rc_status']:<8} "
-        f"RSSI={optional_text(snapshot['rc_rssi'])} "
-        f"CH1={optional_text(snapshot['rc_channel_1'])} "
-        f"CH2={optional_text(snapshot['rc_channel_2'])} "
-        f"CH3={optional_text(snapshot['rc_channel_3'])} "
-        f"CH4={optional_text(snapshot['rc_channel_4'])}\n"
-        f"Battery: "
-        f"{optional_text(snapshot['battery_voltage_v'], 2)} V, "
-        f"{optional_text(snapshot['battery_current_a'], 2)} A, "
-        f"{optional_text(snapshot['battery_remaining_pct'])}%\n"
-        f"LiDAR: {snapshot['lidar_status']:<8} "
-        f"distance="
-        f"{optional_text(snapshot['lidar_distance_m'], 2)} m "
-        f"strength="
-        f"{optional_text(snapshot['lidar_strength'])} "
-        f"temperature="
-        f"{optional_text(snapshot['lidar_temperature_c'], 1)} C\n"
-        f"BME280: {snapshot['bme280_status']:<8} "
-        f"air_temp="
-        f"{optional_text(snapshot['air_temperature_c'], 2)} C "
-        f"humidity="
-        f"{optional_text(snapshot['relative_humidity_pct'], 2)} % "
-        f"pressure="
-        f"{optional_text(snapshot['air_pressure_hpa'], 2)} hPa\n"
-        f"DS18B20: {snapshot['ds18b20_status']:<8} "
-        f"temperature="
-        f"{optional_text(snapshot['ds18b20_temperature_c'], 3)} C"
+def cleanup_ais_multipart() -> None:
+    now = now_monotonic()
+
+    expired = [
+        key
+        for key, entry in ais_multipart.items()
+        if now - entry["created"] > 10.0
+    ]
+
+    for key in expired:
+        del ais_multipart[key]
+
+
+def decode_ais_line(line: str) -> None:
+    parts = line.split(",")
+
+    if len(parts) < 7:
+        return
+
+    try:
+        total_fragments = int(parts[1])
+        fragment_number = int(parts[2])
+    except ValueError:
+        return
+
+    if total_fragments == 1:
+        process_ais_message(decode(line))
+        return
+
+    sequence_id = parts[3]
+    channel = parts[4]
+
+    # Sequence IDs can be blank. For a single receiver, channel + fragment
+    # count + sequence ID is adequate for the normal Type-5/Type-24 traffic
+    # expected here. Old incomplete groups are purged after 10 seconds.
+    key = (sequence_id, channel, total_fragments)
+
+    entry = ais_multipart.setdefault(
+        key,
+        {
+            "created": now_monotonic(),
+            "fragments": {},
+        },
     )
 
+    entry["fragments"][fragment_number] = line
 
-def create_csv_writer():
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    if len(entry["fragments"]) == total_fragments:
+        fragments = [
+            entry["fragments"][i]
+            for i in range(1, total_fragments + 1)
+        ]
 
-    run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    csv_path = DATA_DIR / f"boat_run_{run_timestamp}.csv"
+        del ais_multipart[key]
+        process_ais_message(decode(*fragments))
 
-    csv_file = csv_path.open(
+    cleanup_ais_multipart()
+
+
+def cleanup_old_ais_vessels() -> None:
+    now = now_monotonic()
+
+    with ais_lock:
+        expired = []
+
+        for mmsi, vessel in ais_vessels.items():
+            last_seen = vessel.get("last_seen_monotonic")
+            if last_seen is not None and now - last_seen > AIS_VESSEL_REMOVE_S:
+                expired.append(mmsi)
+
+        for mmsi in expired:
+            del ais_vessels[mmsi]
+
+        vessel_count = len(ais_vessels)
+
+    with state_lock:
+        state.ais_vessel_count = vessel_count
+
+
+def read_ais() -> None:
+    if not ENABLE_AIS:
+        with state_lock:
+            state.ais_status = "DISABLED"
+        return
+
+    while True:
+        ser = None
+
+        try:
+            print(f"[AIS] Opening {AIS_PORT} @ {AIS_BAUD}")
+
+            ser = serial.Serial(
+                AIS_PORT,
+                AIS_BAUD,
+                timeout=1,
+            )
+
+            ser.reset_input_buffer()
+            print("[AIS] Connected")
+
+            with state_lock:
+                state.ais_error = None
+
+            while True:
+                raw = ser.readline()
+
+                if not raw:
+                    cleanup_old_ais_vessels()
+                    continue
+
+                line = raw.decode("ascii", errors="ignore").strip()
+
+                if not (
+                    line.startswith("!AIVDM")
+                    or line.startswith("!AIVDO")
+                ):
+                    continue
+
+                try:
+                    decode_ais_line(line)
+                except Exception as exc:
+                    # One malformed AIS sentence must not kill the receiver.
+                    print(f"[AIS] Decode error: {exc}")
+
+                cleanup_old_ais_vessels()
+
+        except Exception as exc:
+            print(f"[AIS] ERROR: {exc}")
+
+            with state_lock:
+                state.ais_error = str(exc)
+
+        finally:
+            if ser is not None:
+                try:
+                    ser.close()
+                except Exception:
+                    pass
+
+        print(f"[AIS] Reconnecting in {AIS_RECONNECT_DELAY_S:.0f} s...")
+        time.sleep(AIS_RECONNECT_DELAY_S)
+
+
+# ============================================================
+# Snapshot
+# ============================================================
+
+def snapshot_state() -> dict:
+    with state_lock:
+        state.pixhawk_status = status_from_age(
+            ENABLE_PIXHAWK,
+            state.pixhawk_last_update,
+            PIXHAWK_STALE_S,
+        )
+
+        state.lidar_status = status_from_age(
+            ENABLE_LIDAR,
+            state.lidar_last_update,
+            LIDAR_STALE_S,
+        )
+
+        state.bme280_status = status_from_age(
+            ENABLE_BME280,
+            state.bme280_last_update,
+            BME280_STALE_S,
+        )
+
+        state.ds18b20_status = status_from_age(
+            ENABLE_DS18B20,
+            state.ds18b20_last_update,
+            DS18B20_STALE_S,
+        )
+
+        state.ais_status = status_from_age(
+            ENABLE_AIS,
+            state.ais_last_update,
+            AIS_STALE_S,
+        )
+
+        state.timestamp = wall_clock_timestamp()
+        snapshot = asdict(state)
+
+    snapshot["pixhawk_age_s"] = age_seconds(
+        snapshot.pop("pixhawk_last_update")
+    )
+    snapshot["lidar_age_s"] = age_seconds(
+        snapshot.pop("lidar_last_update")
+    )
+    snapshot["bme280_age_s"] = age_seconds(
+        snapshot.pop("bme280_last_update")
+    )
+    snapshot["ds18b20_age_s"] = age_seconds(
+        snapshot.pop("ds18b20_last_update")
+    )
+    snapshot["ais_age_s"] = age_seconds(
+        snapshot.pop("ais_last_update")
+    )
+
+    own_lat, own_lon, own_source = get_own_position(snapshot)
+    snapshot["own_position_lat_deg"] = own_lat
+    snapshot["own_position_lon_deg"] = own_lon
+    snapshot["own_position_source"] = own_source
+
+    return snapshot
+
+
+def snapshot_ais_vessels() -> list[dict]:
+    with ais_lock:
+        return [vessel.copy() for vessel in ais_vessels.values()]
+
+
+# ============================================================
+# Terminal display
+# ============================================================
+
+def print_ais_table(snapshot: dict) -> None:
+    own_lat = snapshot.get("own_position_lat_deg")
+    own_lon = snapshot.get("own_position_lon_deg")
+    own_source = snapshot.get("own_position_source")
+    own_heading = snapshot.get("heading_deg")
+    own_course = snapshot.get("ground_course_deg")
+    own_speed = snapshot.get("ground_speed_mps")
+
+    vessels = snapshot_ais_vessels()
+    now = now_monotonic()
+
+    rows = []
+
+    for vessel in vessels:
+        lat = vessel.get("lat")
+        lon = vessel.get("lon")
+
+        if lat is None or lon is None:
+            continue
+
+        last_position = vessel.get("last_position_monotonic")
+        age = None if last_position is None else now - last_position
+
+        target_state = (
+            "ACTIVE"
+            if age is not None and age <= AIS_TARGET_ACTIVE_S
+            else "STALE"
+        )
+
+        distance_m = None
+        bearing_deg = None
+        rel_bearing = None
+        cpa_m = None
+        tcpa_s = None
+
+        if own_lat is not None and own_lon is not None:
+            distance_m, bearing_deg = distance_and_bearing(
+                own_lat,
+                own_lon,
+                lat,
+                lon,
+            )
+
+            rel_bearing = relative_bearing_deg(
+                bearing_deg,
+                own_heading,
+            )
+
+        # CPA/TCPA needs a real own-ship position and motion solution.
+        # Do not produce collision-prediction numbers from the fixed fallback
+        # reference point.
+        if own_source == "PIXHAWK":
+            cpa_m, tcpa_s = cpa_tcpa(
+                distance_m,
+                bearing_deg,
+                own_speed,
+                own_course,
+                vessel.get("speed_knots"),
+                vessel.get("course_deg"),
+            )
+
+        rows.append((
+            float("inf") if distance_m is None else distance_m,
+            vessel,
+            age,
+            target_state,
+            distance_m,
+            bearing_deg,
+            rel_bearing,
+            cpa_m,
+            tcpa_s,
+        ))
+
+    rows.sort(key=lambda row: row[0])
+
+    print(
+        f"AIS       [{snapshot['ais_status']}]  "
+        f"vessels={snapshot['ais_vessel_count']}  "
+        f"last_msg={fmt(snapshot['ais_age_s'], 1)} s"
+    )
+
+    print(
+        f"OWN POS   "
+        f"lat={fmt(own_lat, 6)}  "
+        f"lon={fmt(own_lon, 6)}  "
+        f"source={own_source}"
+    )
+
+    if not rows:
+        print("AIS TARGETS: no vessels with valid position yet")
+        return
+
+    print("AIS TARGETS:")
+    print(
+        "  "
+        f"{'MMSI':<10} "
+        f"{'NAME':<18} "
+        f"{'STATE':<6} "
+        f"{'DIST':>8} "
+        f"{'BRG':>5} "
+        f"{'REL':>6} "
+        f"{'SOG':>5} "
+        f"{'COG':>6} "
+        f"{'HDG':>5} "
+        f"{'CPA':>8} "
+        f"{'TCPA':>7} "
+        f"{'POSAGE':>7}"
+    )
+
+    for row in rows[:AIS_TABLE_MAX_ROWS]:
+        (
+            _, vessel, age, target_state, distance_m, bearing_deg,
+            rel_bearing, cpa_m, tcpa_s
+        ) = row
+
+        name = (vessel.get("name") or "-")[:18]
+
+        if distance_m is None:
+            distance_text = "--"
+        elif distance_m < 1000:
+            distance_text = f"{distance_m:.0f}m"
+        else:
+            distance_text = f"{distance_m / 1000.0:.2f}km"
+
+        if cpa_m is None:
+            cpa_text = "--"
+        elif cpa_m < 1000:
+            cpa_text = f"{cpa_m:.0f}m"
+        else:
+            cpa_text = f"{cpa_m / 1000.0:.2f}km"
+
+        if tcpa_s is None:
+            tcpa_text = "--"
+        else:
+            tcpa_text = f"{tcpa_s / 60.0:.1f}m"
+
+        age_text = "--" if age is None else f"{age:.0f}s"
+
+        print(
+            "  "
+            f"{vessel['mmsi']:<10} "
+            f"{name:<18} "
+            f"{target_state:<6} "
+            f"{distance_text:>8} "
+            f"{fmt(bearing_deg, 0):>5} "
+            f"{fmt(rel_bearing, 0):>6} "
+            f"{fmt(vessel.get('speed_knots'), 1):>5} "
+            f"{fmt(vessel.get('course_deg'), 1):>6} "
+            f"{fmt(vessel.get('heading_deg'), 0):>5} "
+            f"{cpa_text:>8} "
+            f"{tcpa_text:>7} "
+            f"{age_text:>7}"
+        )
+
+
+def print_snapshot(data: dict) -> None:
+    print()
+    print("=" * 100)
+    print(data["timestamp"])
+
+    print(
+        f"PIXHAWK  [{data['pixhawk_status']}]  "
+        f"mode={data['flight_mode']}  "
+        f"armed={data['armed']}"
+    )
+
+    print(
+        f"GPS       "
+        f"lat={fmt(data['latitude_deg'], 6)}  "
+        f"lon={fmt(data['longitude_deg'], 6)}  "
+        f"fix={fmt(data['gps_fix_type'])}  "
+        f"sats={fmt(data['gps_satellites'])}"
+    )
+
+    print(
+        f"NAV       "
+        f"heading={fmt(data['heading_deg'], 1)} deg  "
+        f"course={fmt(data['ground_course_deg'], 1)} deg  "
+        f"speed={fmt(data['ground_speed_mps'], 2)} m/s"
+    )
+
+    print(
+        f"BATTERY   "
+        f"V={fmt(data['battery_voltage_v'], 2)}  "
+        f"I={fmt(data['battery_current_a'], 2)}  "
+        f"remaining={fmt(data['battery_remaining_pct'])}%"
+    )
+
+    print(
+        f"RC        "
+        f"{fmt(data['rc1'])} "
+        f"{fmt(data['rc2'])} "
+        f"{fmt(data['rc3'])} "
+        f"{fmt(data['rc4'])}"
+    )
+
+    print(
+        f"LIDAR     [{data['lidar_status']}]  "
+        f"d={fmt(data['lidar_distance_m'], 2)} m  "
+        f"strength={fmt(data['lidar_strength'])}  "
+        f"T_internal={fmt(data['lidar_temperature_c'], 1)} C"
+    )
+
+    print(
+        f"BME280    [{data['bme280_status']}]  "
+        f"T={fmt(data['air_temperature_c'], 2)} C  "
+        f"RH={fmt(data['relative_humidity_pct'], 1)}%  "
+        f"P={fmt(data['air_pressure_hpa'], 1)} hPa"
+    )
+
+    print(
+        f"DS18B20   [{data['ds18b20_status']}]  "
+        f"T={fmt(data['ds18b20_temperature_c'], 2)} C"
+    )
+
+    print_ais_table(data)
+
+    for sensor in (
+        "pixhawk",
+        "lidar",
+        "bme280",
+        "ds18b20",
+        "ais",
+    ):
+        error = data.get(f"{sensor}_error")
+        if error:
+            print(f"{sensor.upper()} ERROR: {error}")
+
+
+# ============================================================
+# CSV
+# ============================================================
+
+def create_csv_file(snapshot: dict):
+    DATA_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    filename = (
+        "boat_"
+        + datetime.now().strftime("%Y%m%d_%H%M%S")
+        + ".csv"
+    )
+
+    path = DATA_DIR / filename
+
+    file_handle = path.open(
         "w",
         newline="",
-        encoding="utf-8",
+        buffering=1,
     )
 
-    fieldnames = list(snapshot_state(SharedState()).keys())
-
     writer = csv.DictWriter(
-        csv_file,
-        fieldnames=fieldnames,
+        file_handle,
+        fieldnames=list(snapshot.keys()),
     )
 
     writer.writeheader()
-    csv_file.flush()
+    print(f"[CSV] Logging to {path}")
 
-    return csv_path, csv_file, writer
+    return file_handle, writer
 
+
+# ============================================================
+# Main
+# ============================================================
 
 def main() -> None:
-    state = SharedState()
-    stop_event = threading.Event()
+    print()
+    print("Boat Monitor")
+    print("=" * 100)
 
-    csv_path, csv_file, csv_writer = create_csv_writer()
-
-    print(f"[Logger] Writing CSV to {csv_path}")
     threads = []
-    
-    if ENABLE_PIXHAWK:
-        pixhawk_thread = threading.Thread(
-            target=read_pixhawk,
-            args=(state, stop_event),
-            daemon=True,
-            name="pixhawk-reader",
-        )
-        pixhawk_thread.start()
-        threads.append(pixhawk_thread)
-    else:
-        print("[Pixhawk] Disabled by configuration")
 
-    if ENABLE_LIDAR:
-        lidar_thread = threading.Thread(
-            target=read_lidar,
-            args=(state, stop_event),
-            daemon=True,
-            name="lidar-reader",
-        )
-        lidar_thread.start()
-        threads.append(lidar_thread)
-    else:
-        print("[LiDAR] Disabled by configuration")
-     
-    if ENABLE_BME280:
-        bme280_thread = threading.Thread(
-            target=read_bme280,
-            args=(state, stop_event),
-            daemon=True,
-            name="bme280-reader",
-        )
-        bme280_thread.start()
-        threads.append(bme280_thread)
-    else:
-        print("[BME280] Disabled by configuration")
+    readers = [
+        ("pixhawk", read_pixhawk),
+        ("lidar", read_lidar),
+        ("bme280", read_bme280),
+        ("ds18b20", read_ds18b20),
+        ("ais", read_ais),
+    ]
 
-    if ENABLE_DS18B20:
-        ds18b20_thread = threading.Thread(
-            target=read_ds18b20,
-            args=(state, stop_event),
+    for name, target in readers:
+        thread = threading.Thread(
+            target=target,
+            name=name,
             daemon=True,
-            name="ds18b20-reader",
         )
 
-        ds18b20_thread.start()
-        threads.append(ds18b20_thread)
+        thread.start()
+        threads.append(thread)
 
-    else:
-        print("[DS18B20] Disabled by configuration")
-    
-    last_print = 0.0
-    last_log = 0.0
+    # Let the readers initialize before creating the first CSV snapshot.
+    time.sleep(1.0)
+
+    first_snapshot = snapshot_state()
+    csv_file, csv_writer = create_csv_file(first_snapshot)
 
     try:
         while True:
-            now = time.monotonic()
-            snapshot = snapshot_state(state)
-
-            if now - last_print >= PRINT_INTERVAL_S:
-                print_status(snapshot)
-                last_print = now
-
-            if now - last_log >= LOG_INTERVAL_S:
-                csv_writer.writerow(snapshot)
-                csv_file.flush()
-                last_log = now
-
-            time.sleep(0.05)
+            snapshot = snapshot_state()
+            print_snapshot(snapshot)
+            csv_writer.writerow(snapshot)
+            time.sleep(MAIN_LOOP_INTERVAL_S)
 
     except KeyboardInterrupt:
-        print("\n[Main] Stopping...")
-        stop_event.set()
+        print()
+        print("[Main] Ctrl+C received, stopping...")
 
     finally:
-        for thread in threads:
-            thread.join(timeout=2)
-        csv_file.flush()
         csv_file.close()
-
-        print(f"[Logger] CSV saved to {csv_path}")
-        print("[Main] Stopped")
+        print("[Main] CSV closed.")
 
 
 if __name__ == "__main__":
