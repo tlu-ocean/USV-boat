@@ -1,0 +1,1275 @@
+#!/usr/bin/env python3
+
+import math
+import time
+
+import rclpy
+from rclpy.node import Node
+
+from pymavlink import mavutil
+
+from sensor_msgs.msg import (
+    NavSatFix,
+    NavSatStatus,
+    BatteryState,
+)
+
+from std_msgs.msg import (
+    Bool,
+    Float32,
+    Int32,
+    String,
+    UInt8,
+)
+
+
+class PixhawkNode(Node):
+
+    def __init__(self):
+        super().__init__("pixhawk_node")
+
+        # ====================================================
+        # Parameters
+        # ====================================================
+
+        self.declare_parameter(
+            "port",
+            "/dev/serial0",
+        )
+
+        self.declare_parameter(
+            "baud",
+            115200,
+        )
+
+        self.declare_parameter(
+            "gps_frame_id",
+            "gps_link",
+        )
+
+        self.declare_parameter(
+            "poll_rate_hz",
+            100.0,
+        )
+
+        self.declare_parameter(
+            "reconnect_interval_s",
+            2.0,
+        )
+
+        self.declare_parameter(
+            "heartbeat_timeout_s",
+            3.0,
+        )
+
+        # Navigation -> Pixhawk control bridge.
+        #
+        # IMPORTANT:
+        # Live MAVLink control is intentionally NOT implemented yet.
+        # This parameter remains False during dry-run testing.
+        self.declare_parameter(
+            "enable_guided_control",
+            False,
+        )
+
+        self.declare_parameter(
+            "guided_command_timeout_s",
+            1.0,
+        )
+
+        # AUTO restore remains disabled for the first
+        # live mode-switch bench test.
+        self.declare_parameter(
+            "enable_auto_restore",
+            False,
+        )
+
+        # Position target transmission is still disabled.
+        self.declare_parameter(
+            "enable_guided_target_control",
+            False,
+        )
+
+        self.port = (
+            self.get_parameter("port")
+            .get_parameter_value()
+            .string_value
+        )
+
+        self.baud = (
+            self.get_parameter("baud")
+            .get_parameter_value()
+            .integer_value
+        )
+
+        self.gps_frame_id = (
+            self.get_parameter("gps_frame_id")
+            .get_parameter_value()
+            .string_value
+        )
+
+        poll_rate_hz = (
+            self.get_parameter("poll_rate_hz")
+            .get_parameter_value()
+            .double_value
+        )
+
+        self.reconnect_interval_s = (
+            self.get_parameter(
+                "reconnect_interval_s"
+            )
+            .get_parameter_value()
+            .double_value
+        )
+
+        self.heartbeat_timeout_s = (
+            self.get_parameter(
+                "heartbeat_timeout_s"
+            )
+            .get_parameter_value()
+            .double_value
+        )
+
+        self.enable_guided_control = (
+            self.get_parameter(
+                "enable_guided_control"
+            )
+            .get_parameter_value()
+            .bool_value
+        )
+
+        self.guided_command_timeout_s = (
+            self.get_parameter(
+                "guided_command_timeout_s"
+            )
+            .get_parameter_value()
+            .double_value
+        )
+
+        self.enable_auto_restore = (
+            self.get_parameter(
+                "enable_auto_restore"
+            )
+            .get_parameter_value()
+            .bool_value
+        )
+
+        self.enable_guided_target_control = (
+            self.get_parameter(
+                "enable_guided_target_control"
+            )
+            .get_parameter_value()
+            .bool_value
+        )
+
+        # ====================================================
+        # Publishers
+        # ====================================================
+
+        self.gps_pub = self.create_publisher(
+            NavSatFix,
+            "/boat/gps/fix",
+            10,
+        )
+
+        self.gps_fix_type_pub = (
+            self.create_publisher(
+                UInt8,
+                "/boat/gps/fix_type",
+                10,
+            )
+        )
+
+        self.gps_satellites_pub = (
+            self.create_publisher(
+                UInt8,
+                "/boat/gps/satellites",
+                10,
+            )
+        )
+
+        self.heading_pub = self.create_publisher(
+            Float32,
+            "/boat/heading",
+            10,
+        )
+
+        self.course_pub = self.create_publisher(
+            Float32,
+            "/boat/course",
+            10,
+        )
+
+        self.speed_pub = self.create_publisher(
+            Float32,
+            "/boat/speed",
+            10,
+        )
+
+        self.mode_pub = self.create_publisher(
+            String,
+            "/boat/mode",
+            10,
+        )
+
+        self.armed_pub = self.create_publisher(
+            Bool,
+            "/boat/armed",
+            10,
+        )
+
+        self.battery_pub = self.create_publisher(
+            BatteryState,
+            "/boat/battery",
+            10,
+        )
+
+        self.connected_pub = self.create_publisher(
+            Bool,
+            "/boat/mavlink/connected",
+            10,
+        )
+
+        self.control_status_pub = self.create_publisher(
+            String,
+            "/boat/control/status",
+            10,
+        )
+
+        # ====================================================
+        # MAVLink state
+        # ====================================================
+
+        self.connection = None
+
+        self.last_connect_attempt = 0.0
+
+        self.last_heartbeat_time = None
+
+        self.current_mode = "UNKNOWN"
+        self.current_armed = False
+
+        # ====================================================
+        # Guided-control dry-run state
+        # ====================================================
+
+        self.guided_mode_request = "HOLD"
+        self.guided_target_valid = False
+        self.guided_x_forward_m = float("nan")
+        self.guided_y_right_m = float("nan")
+        self.guided_speed_scale = 0.0
+        self.guided_request_seq = 0
+
+        self.guided_update_times = {
+            "mode": 0.0,
+            "target_valid": 0.0,
+            "x": 0.0,
+            "y": 0.0,
+            "speed": 0.0,
+            "seq": 0.0,
+        }
+
+        self.last_handled_guided_seq = None
+        self.last_guided_target = None
+        self.last_mode_request_logged = None
+        self.last_speed_scale_logged = None
+        self.live_control_warning_sent = False
+
+        self.last_live_mode_command = None
+        self.last_live_mode_command_time = 0.0
+
+        # Manual/RC mode changes must override autonomy.
+        self.control_inhibited_by_manual_override = False
+        self.live_guided_seq_sent = None
+
+        self.guided_subscriptions = []
+
+        self.guided_subscriptions.append(
+            self.create_subscription(
+                String,
+                "/navigation/guided/mode_request",
+                self.guided_mode_callback,
+                10,
+            )
+        )
+
+        self.guided_subscriptions.append(
+            self.create_subscription(
+                Bool,
+                "/navigation/guided/target_valid",
+                self.guided_target_valid_callback,
+                10,
+            )
+        )
+
+        self.guided_subscriptions.append(
+            self.create_subscription(
+                Float32,
+                "/navigation/guided/x_forward_m",
+                self.guided_x_callback,
+                10,
+            )
+        )
+
+        self.guided_subscriptions.append(
+            self.create_subscription(
+                Float32,
+                "/navigation/guided/y_right_m",
+                self.guided_y_callback,
+                10,
+            )
+        )
+
+        self.guided_subscriptions.append(
+            self.create_subscription(
+                Float32,
+                "/navigation/guided/speed_scale",
+                self.guided_speed_callback,
+                10,
+            )
+        )
+
+        self.guided_subscriptions.append(
+            self.create_subscription(
+                Int32,
+                "/navigation/guided/request_seq",
+                self.guided_seq_callback,
+                10,
+            )
+        )
+
+        # ====================================================
+        # Timers
+        # ====================================================
+
+        self.poll_timer = self.create_timer(
+            1.0 / poll_rate_hz,
+            self.poll_mavlink,
+        )
+
+        self.status_timer = self.create_timer(
+            1.0,
+            self.publish_connection_status,
+        )
+
+        self.guided_control_timer = self.create_timer(
+            0.2,
+            self.evaluate_guided_control,
+        )
+
+        self.get_logger().info(
+            "Pixhawk node started"
+        )
+
+        self.get_logger().warning(
+            "Guided-control bridge is in DRY-RUN mode; "
+            "no MAVLink control commands will be transmitted"
+        )
+
+    # ========================================================
+    # Connection
+    # ========================================================
+
+    def connect_pixhawk(self):
+
+        now = time.monotonic()
+
+        if (
+            now - self.last_connect_attempt
+            < self.reconnect_interval_s
+        ):
+            return
+
+        self.last_connect_attempt = now
+
+        try:
+
+            self.get_logger().info(
+                f"Connecting to Pixhawk "
+                f"{self.port} @ {self.baud}"
+            )
+
+            self.connection = (
+                mavutil.mavlink_connection(
+                    self.port,
+                    baud=self.baud,
+                )
+            )
+
+            self.get_logger().info(
+                "MAVLink serial port opened"
+            )
+
+        except Exception as exc:
+
+            self.get_logger().warning(
+                f"Pixhawk connection failed: "
+                f"{exc}"
+            )
+
+            self.connection = None
+
+    def disconnect_pixhawk(self):
+
+        if self.connection is not None:
+
+            try:
+                self.connection.close()
+
+            except Exception:
+                pass
+
+        self.connection = None
+        self.last_heartbeat_time = None
+
+    # ========================================================
+    # MAVLink polling
+    # ========================================================
+
+    def poll_mavlink(self):
+
+        if self.connection is None:
+
+            self.connect_pixhawk()
+
+            return
+
+        try:
+
+            # Process all messages currently available,
+            # but cap the work per timer callback.
+            for _ in range(100):
+
+                msg = self.connection.recv_match(
+                    blocking=False
+                )
+
+                if msg is None:
+                    break
+
+                self.process_message(msg)
+
+        except Exception as exc:
+
+            self.get_logger().error(
+                f"MAVLink read error: {exc}"
+            )
+
+            self.disconnect_pixhawk()
+
+    # ========================================================
+    # Message handling
+    # ========================================================
+
+    def process_message(self, msg):
+
+        msg_type = msg.get_type()
+
+        if msg_type == "BAD_DATA":
+            return
+
+        # ----------------------------------------------------
+        # HEARTBEAT
+        # ----------------------------------------------------
+
+        if msg_type == "HEARTBEAT":
+
+            self.last_heartbeat_time = (
+                time.monotonic()
+            )
+
+            try:
+                mode = (
+                    mavutil.mode_string_v10(msg)
+                )
+
+            except Exception:
+                mode = "UNKNOWN"
+
+            armed = bool(
+                msg.base_mode
+                & mavutil.mavlink
+                .MAV_MODE_FLAG_SAFETY_ARMED
+            )
+
+            self.current_mode = mode
+            self.current_armed = armed
+
+            mode_msg = String()
+            mode_msg.data = mode
+
+            armed_msg = Bool()
+            armed_msg.data = armed
+
+            self.mode_pub.publish(mode_msg)
+            self.armed_pub.publish(armed_msg)
+
+        # ----------------------------------------------------
+        # GPS_RAW_INT
+        # ----------------------------------------------------
+
+        elif msg_type == "GPS_RAW_INT":
+
+            fix_type = int(msg.fix_type)
+
+            satellites = int(
+                msg.satellites_visible
+            )
+
+            # Separate raw MAVLink GPS status topics.
+            fix_msg = UInt8()
+            fix_msg.data = fix_type
+
+            sats_msg = UInt8()
+
+            # MAVLink may use 255 for unknown.
+            if satellites == 255:
+                sats_msg.data = 0
+            else:
+                sats_msg.data = satellites
+
+            self.gps_fix_type_pub.publish(
+                fix_msg
+            )
+
+            self.gps_satellites_pub.publish(
+                sats_msg
+            )
+
+            # Standard ROS NavSatFix
+            gps_msg = NavSatFix()
+
+            gps_msg.header.stamp = (
+                self.get_clock()
+                .now()
+                .to_msg()
+            )
+
+            gps_msg.header.frame_id = (
+                self.gps_frame_id
+            )
+
+            gps_msg.status.service = (
+                NavSatStatus.SERVICE_GPS
+            )
+
+            # MAVLink:
+            # 0 = no GPS
+            # 1 = no fix
+            # 2 = 2D fix
+            # 3+ = 3D / DGPS / RTK...
+            if fix_type >= 2:
+
+                gps_msg.status.status = (
+                    NavSatStatus.STATUS_FIX
+                )
+
+                gps_msg.latitude = (
+                    msg.lat / 1e7
+                )
+
+                gps_msg.longitude = (
+                    msg.lon / 1e7
+                )
+
+            else:
+
+                gps_msg.status.status = (
+                    NavSatStatus.STATUS_NO_FIX
+                )
+
+                gps_msg.latitude = (
+                    float("nan")
+                )
+
+                gps_msg.longitude = (
+                    float("nan")
+                )
+
+            if fix_type >= 3:
+
+                gps_msg.altitude = (
+                    msg.alt / 1000.0
+                )
+
+            else:
+
+                gps_msg.altitude = (
+                    float("nan")
+                )
+
+            gps_msg.position_covariance_type = (
+                NavSatFix
+                .COVARIANCE_TYPE_UNKNOWN
+            )
+
+            self.gps_pub.publish(
+                gps_msg
+            )
+
+        # ----------------------------------------------------
+        # GLOBAL_POSITION_INT
+        # ----------------------------------------------------
+
+        elif msg_type == "GLOBAL_POSITION_INT":
+
+            # Heading
+            if msg.hdg != 65535:
+
+                heading_msg = Float32()
+
+                heading_msg.data = (
+                    msg.hdg / 100.0
+                )
+
+                self.heading_pub.publish(
+                    heading_msg
+                )
+
+            # Velocity components:
+            # vx = North cm/s
+            # vy = East cm/s
+            vx_mps = msg.vx / 100.0
+            vy_mps = msg.vy / 100.0
+
+            speed_mps = math.hypot(
+                vx_mps,
+                vy_mps,
+            )
+
+            speed_msg = Float32()
+            speed_msg.data = speed_mps
+
+            self.speed_pub.publish(
+                speed_msg
+            )
+
+            # Course over ground.
+            #
+            # atan2(East, North)
+            # gives clockwise degrees from North.
+            if speed_mps >= 0.05:
+
+                course_deg = (
+                    math.degrees(
+                        math.atan2(
+                            vy_mps,
+                            vx_mps,
+                        )
+                    )
+                    + 360.0
+                ) % 360.0
+
+                course_msg = Float32()
+                course_msg.data = course_deg
+
+                self.course_pub.publish(
+                    course_msg
+                )
+
+        # ----------------------------------------------------
+        # SYS_STATUS
+        # ----------------------------------------------------
+
+        elif msg_type == "SYS_STATUS":
+
+            battery_msg = BatteryState()
+
+            battery_msg.header.stamp = (
+                self.get_clock()
+                .now()
+                .to_msg()
+            )
+
+            voltage_valid = (
+                msg.voltage_battery
+                != 65535
+            )
+
+            current_valid = (
+                msg.current_battery
+                != -1
+            )
+
+            remaining_valid = (
+                msg.battery_remaining
+                != -1
+            )
+
+            if voltage_valid:
+
+                battery_msg.voltage = (
+                    msg.voltage_battery
+                    / 1000.0
+                )
+
+            else:
+
+                battery_msg.voltage = (
+                    float("nan")
+                )
+
+            if current_valid:
+
+                battery_msg.current = (
+                    msg.current_battery
+                    / 100.0
+                )
+
+            else:
+
+                battery_msg.current = (
+                    float("nan")
+                )
+
+            if remaining_valid:
+
+                battery_msg.percentage = (
+                    msg.battery_remaining
+                    / 100.0
+                )
+
+            else:
+
+                battery_msg.percentage = (
+                    float("nan")
+                )
+
+            battery_msg.present = (
+                voltage_valid
+                or current_valid
+                or remaining_valid
+            )
+
+            self.battery_pub.publish(
+                battery_msg
+            )
+
+    # ========================================================
+    # Guided-control bridge -- DRY RUN
+    # ========================================================
+
+    def mark_guided_update(self, name):
+        self.guided_update_times[name] = (
+            time.monotonic()
+        )
+
+    def guided_mode_callback(self, msg):
+        self.guided_mode_request = (
+            msg.data.strip().upper()
+        )
+        self.mark_guided_update("mode")
+
+    def guided_target_valid_callback(self, msg):
+        self.guided_target_valid = bool(msg.data)
+        self.mark_guided_update(
+            "target_valid"
+        )
+
+    def guided_x_callback(self, msg):
+        self.guided_x_forward_m = float(
+            msg.data
+        )
+        self.mark_guided_update("x")
+
+    def guided_y_callback(self, msg):
+        self.guided_y_right_m = float(
+            msg.data
+        )
+        self.mark_guided_update("y")
+
+    def guided_speed_callback(self, msg):
+        self.guided_speed_scale = float(
+            msg.data
+        )
+        self.mark_guided_update("speed")
+
+    def guided_seq_callback(self, msg):
+
+        new_seq = int(msg.data)
+
+        if new_seq != self.guided_request_seq:
+            self.control_inhibited_by_manual_override = False
+
+        self.guided_request_seq = new_seq
+        self.mark_guided_update("seq")
+
+    def guided_input_fresh(
+        self,
+        name,
+        now,
+    ):
+
+        timestamp = (
+            self.guided_update_times[name]
+        )
+
+        return (
+            timestamp > 0.0
+            and now - timestamp
+            <= self.guided_command_timeout_s
+        )
+
+    def mavlink_heartbeat_healthy(self):
+
+        if self.last_heartbeat_time is None:
+            return False
+
+        age = (
+            time.monotonic()
+            - self.last_heartbeat_time
+        )
+
+        return (
+            age
+            <= self.heartbeat_timeout_s
+        )
+
+    def publish_control_status(
+        self,
+        text,
+    ):
+
+        msg = String()
+        msg.data = text
+
+        self.control_status_pub.publish(
+            msg
+        )
+
+    def request_live_mode(self, mode_name):
+
+        if not self.enable_guided_control:
+            return False
+
+        if (
+            mode_name == "AUTO"
+            and not self.enable_auto_restore
+        ):
+            return False
+
+        if self.connection is None:
+            return False
+
+        if not self.mavlink_heartbeat_healthy():
+            return False
+
+        # Already confirmed by HEARTBEAT.
+        if self.current_mode == mode_name:
+            return True
+
+        now = time.monotonic()
+
+        # Do not spam mode commands while waiting
+        # for the next HEARTBEAT confirmation.
+        if (
+            self.last_live_mode_command == mode_name
+            and now - self.last_live_mode_command_time < 1.0
+        ):
+            return False
+
+        try:
+
+            mode_map = self.connection.mode_mapping()
+
+            if (
+                mode_map is None
+                or mode_name not in mode_map
+            ):
+                self.get_logger().error(
+                    f"Cannot request mode {mode_name}: "
+                    "mode is not available in Pixhawk mode mapping"
+                )
+                return False
+
+            self.connection.set_mode_apm(
+                mode_name
+            )
+
+            self.last_live_mode_command = (
+                mode_name
+            )
+
+            self.last_live_mode_command_time = (
+                now
+            )
+
+            self.get_logger().warning(
+                "LIVE MAVLink | "
+                f"REQUEST MODE={mode_name} | "
+                f"current_mode={self.current_mode} | "
+                f"armed={self.current_armed}"
+            )
+
+            return True
+
+        except Exception as exc:
+
+            self.get_logger().error(
+                f"Failed to request mode "
+                f"{mode_name}: {exc}"
+            )
+
+            return False
+
+    def evaluate_guided_control(self):
+
+        now = time.monotonic()
+
+        if (
+            self.enable_guided_control
+            and not self.live_control_warning_sent
+        ):
+
+            self.get_logger().warning(
+                "LIVE MAVLink MODE CONTROL enabled | "
+                "vehicle must remain DISARMED for this test | "
+                "Guided POSITION TARGET transmission remains disabled"
+            )
+
+            self.live_control_warning_sent = True
+
+        if (
+            self.enable_guided_target_control
+            and not self.enable_guided_control
+        ):
+            self.get_logger().error(
+                "enable_guided_target_control requires "
+                "enable_guided_control=true"
+            )
+
+        # Need at least mode + validity from the
+        # guided_target_node.
+        if not (
+            self.guided_input_fresh(
+                "mode",
+                now,
+            )
+            and self.guided_input_fresh(
+                "target_valid",
+                now,
+            )
+        ):
+            return
+
+        mode_request = (
+            self.guided_mode_request
+        )
+
+        pixhawk_ready = (
+            self.mavlink_heartbeat_healthy()
+        )
+
+        # ----------------------------------------------------
+        # GUIDED target
+        # ----------------------------------------------------
+
+        if mode_request == "GUIDED":
+
+            # Never fight a human RC/manual mode change.
+            if self.control_inhibited_by_manual_override:
+
+                self.publish_control_status(
+                    "MANUAL_OVERRIDE_INHIBIT"
+                )
+
+                return
+
+            # One mode request per new avoidance target.
+            if (
+                self.guided_request_seq
+                != self.live_guided_seq_sent
+            ):
+
+                self.request_live_mode(
+                    "GUIDED"
+                )
+
+                self.live_guided_seq_sent = (
+                    self.guided_request_seq
+                )
+
+            if not self.guided_target_valid:
+
+                status = (
+                    "DRY_RUN_INVALID_GUIDED_TARGET"
+                )
+
+                self.publish_control_status(
+                    status
+                )
+
+                return
+
+            required = (
+                "x",
+                "y",
+                "seq",
+            )
+
+            if not all(
+                self.guided_input_fresh(
+                    key,
+                    now,
+                )
+                for key in required
+            ):
+                return
+
+            x = self.guided_x_forward_m
+            y = self.guided_y_right_m
+            seq = self.guided_request_seq
+
+            if not (
+                math.isfinite(x)
+                and math.isfinite(y)
+            ):
+                return
+
+            # Only a new request_seq creates a new
+            # relative target.
+            if seq != self.last_handled_guided_seq:
+
+                self.last_handled_guided_seq = (
+                    seq
+                )
+
+                self.last_guided_target = (
+                    x,
+                    y,
+                )
+
+                self.get_logger().warning(
+                    "DRY RUN MAVLink | "
+                    f"seq={seq} | "
+                    "WOULD REQUEST MODE=GUIDED | "
+                    "WOULD SEND "
+                    "SET_POSITION_TARGET_LOCAL_NED | "
+                    "frame=BODY_OFFSET_NED | "
+                    f"x_forward={x:.2f}m | "
+                    f"y_right={y:.2f}m | "
+                    f"pixhawk_connected={pixhawk_ready} | "
+                    f"current_mode={self.current_mode} | "
+                    f"armed={self.current_armed}"
+                )
+
+                self.publish_control_status(
+                    "DRY_RUN_GUIDED "
+                    f"seq={seq} "
+                    f"x={x:.2f} "
+                    f"y={y:.2f}"
+                )
+
+            else:
+
+                # Detect an accidental target change
+                # without a sequence increment.
+                if self.last_guided_target is not None:
+
+                    old_x, old_y = (
+                        self.last_guided_target
+                    )
+
+                    if (
+                        abs(x - old_x) > 0.01
+                        or abs(y - old_y) > 0.01
+                    ):
+
+                        self.get_logger().error(
+                            "Guided target changed "
+                            "without request_seq increment: "
+                            f"seq={seq}, "
+                            f"old=({old_x:.2f},{old_y:.2f}), "
+                            f"new=({x:.2f},{y:.2f})"
+                        )
+
+            self.last_mode_request_logged = (
+                "GUIDED"
+            )
+
+            return
+
+        # ----------------------------------------------------
+        # AUTO / normal mission
+        # ----------------------------------------------------
+
+        if mode_request == "AUTO":
+
+            self.request_live_mode(
+                "AUTO"
+            )
+
+            speed_scale = (
+                self.guided_speed_scale
+                if self.guided_input_fresh(
+                    "speed",
+                    now,
+                )
+                else 1.0
+            )
+
+            changed = (
+                self.last_mode_request_logged
+                != "AUTO"
+                or self.last_speed_scale_logged
+                != speed_scale
+            )
+
+            if changed:
+
+                if speed_scale < 0.999:
+
+                    self.get_logger().warning(
+                        "DRY RUN MAVLink | "
+                        "WOULD KEEP/REQUEST MODE=AUTO | "
+                        f"requested speed_scale="
+                        f"{speed_scale:.2f} | "
+                        "speed command mapping is not "
+                        "implemented yet"
+                    )
+
+                    status = (
+                        "DRY_RUN_AUTO_SLOW "
+                        f"scale={speed_scale:.2f}"
+                    )
+
+                else:
+
+                    self.get_logger().info(
+                        "DRY RUN MAVLink | "
+                        "WOULD REQUEST MODE=AUTO"
+                    )
+
+                    status = (
+                        "DRY_RUN_AUTO"
+                    )
+
+                self.publish_control_status(
+                    status
+                )
+
+            self.last_mode_request_logged = (
+                "AUTO"
+            )
+
+            self.last_speed_scale_logged = (
+                speed_scale
+            )
+
+            return
+
+        # ----------------------------------------------------
+        # HOLD / STOP / fail-safe
+        # ----------------------------------------------------
+
+        if mode_request == "HOLD":
+
+            self.request_live_mode(
+                "HOLD"
+            )
+
+            if (
+                self.last_mode_request_logged
+                != "HOLD"
+            ):
+
+                self.get_logger().warning(
+                    "DRY RUN MAVLink | "
+                    "WOULD REQUEST MODE=HOLD | "
+                    f"pixhawk_connected={pixhawk_ready} | "
+                    f"current_mode={self.current_mode} | "
+                    f"armed={self.current_armed}"
+                )
+
+                self.publish_control_status(
+                    "DRY_RUN_HOLD"
+                )
+
+            self.last_mode_request_logged = (
+                "HOLD"
+            )
+
+            return
+
+        # Unknown request -> fail safe.
+        if (
+            self.last_mode_request_logged
+            != mode_request
+        ):
+
+            self.get_logger().warning(
+                "DRY RUN MAVLink | "
+                f"unknown mode_request="
+                f"{mode_request}; "
+                "WOULD FALL BACK TO HOLD"
+            )
+
+            self.publish_control_status(
+                "DRY_RUN_UNKNOWN_REQUEST"
+            )
+
+        self.last_mode_request_logged = (
+            mode_request
+        )
+
+    # ========================================================
+    # Connection status
+    # ========================================================
+
+    def publish_connection_status(self):
+
+        connected = False
+
+        if self.last_heartbeat_time is not None:
+
+            age = (
+                time.monotonic()
+                - self.last_heartbeat_time
+            )
+
+            connected = (
+                age
+                <= self.heartbeat_timeout_s
+            )
+
+        msg = Bool()
+        msg.data = connected
+
+        self.connected_pub.publish(msg)
+
+    # ========================================================
+    # Shutdown
+    # ========================================================
+
+    def destroy_node(self):
+
+        self.disconnect_pixhawk()
+
+        super().destroy_node()
+
+
+def main(args=None):
+
+    rclpy.init(args=args)
+
+    node = PixhawkNode()
+
+    try:
+
+        rclpy.spin(node)
+
+    except KeyboardInterrupt:
+
+        pass
+
+    finally:
+
+        node.destroy_node()
+
+        if rclpy.ok():
+            rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()
+

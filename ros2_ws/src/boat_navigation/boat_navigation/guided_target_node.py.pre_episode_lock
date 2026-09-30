@@ -1,0 +1,265 @@
+#!/usr/bin/env python3
+
+import math
+import time
+
+import rclpy
+from rclpy.node import Node
+
+from std_msgs.msg import Bool
+from std_msgs.msg import Float32
+from std_msgs.msg import Int32
+from std_msgs.msg import String
+
+
+class GuidedTargetNode(Node):
+
+    def __init__(self):
+        super().__init__('guided_target_node')
+
+        # Temporary avoidance geometry.
+        self.declare_parameter('forward_offset_m', 3.0)
+        self.declare_parameter('lateral_offset_m', 1.5)
+        self.declare_parameter('slow_speed_scale', 0.5)
+        self.declare_parameter('stale_timeout_s', 0.75)
+
+        self.forward_offset = float(
+            self.get_parameter('forward_offset_m').value
+        )
+
+        self.lateral_offset = float(
+            self.get_parameter('lateral_offset_m').value
+        )
+
+        self.slow_speed_scale = float(
+            self.get_parameter('slow_speed_scale').value
+        )
+
+        self.stale_timeout = float(
+            self.get_parameter('stale_timeout_s').value
+        )
+
+        self.action = 'UNKNOWN'
+        self.action_time = 0.0
+        self.previous_action = None
+
+        # Increment only when a NEW Guided target is generated.
+        self.request_seq = 0
+
+        self.target_valid = False
+        self.target_x = math.nan
+        self.target_y = math.nan
+        self.mode_request = 'HOLD'
+        self.speed_scale = 0.0
+
+        self.subscription = self.create_subscription(
+            String,
+            '/navigation/avoidance/action',
+            self.action_callback,
+            10
+        )
+
+        self.active_pub = self.create_publisher(
+            Bool,
+            '/navigation/guided/active',
+            10
+        )
+
+        self.target_valid_pub = self.create_publisher(
+            Bool,
+            '/navigation/guided/target_valid',
+            10
+        )
+
+        self.x_pub = self.create_publisher(
+            Float32,
+            '/navigation/guided/x_forward_m',
+            10
+        )
+
+        self.y_pub = self.create_publisher(
+            Float32,
+            '/navigation/guided/y_right_m',
+            10
+        )
+
+        self.mode_pub = self.create_publisher(
+            String,
+            '/navigation/guided/mode_request',
+            10
+        )
+
+        self.speed_pub = self.create_publisher(
+            Float32,
+            '/navigation/guided/speed_scale',
+            10
+        )
+
+        self.seq_pub = self.create_publisher(
+            Int32,
+            '/navigation/guided/request_seq',
+            10
+        )
+
+        self.timer = self.create_timer(
+            0.20,
+            self.evaluate
+        )
+
+        self.last_log = 0.0
+
+        self.get_logger().info(
+            'Guided target node started -- DRY RUN ONLY | '
+            f'forward={self.forward_offset:.2f}m | '
+            f'lateral={self.lateral_offset:.2f}m'
+        )
+
+    def action_callback(self, msg):
+        self.action = msg.data
+        self.action_time = time.monotonic()
+
+    def generate_new_target(self, side):
+        self.request_seq += 1
+
+        self.mode_request = 'GUIDED'
+        self.target_valid = True
+
+        self.target_x = self.forward_offset
+
+        # MAV_FRAME_BODY_OFFSET_NED:
+        # +Y = vehicle right.
+        if side == 'RIGHT':
+            self.target_y = self.lateral_offset
+        else:
+            self.target_y = -self.lateral_offset
+
+        self.speed_scale = 1.0
+
+    def handle_action_change(self):
+
+        if self.action == 'TURN_RIGHT':
+            self.generate_new_target('RIGHT')
+
+        elif self.action == 'TURN_LEFT':
+            self.generate_new_target('LEFT')
+
+        elif self.action == 'SLOW':
+            self.mode_request = 'AUTO'
+            self.target_valid = False
+            self.target_x = math.nan
+            self.target_y = math.nan
+            self.speed_scale = self.slow_speed_scale
+
+        elif self.action == 'KEEP_COURSE':
+            self.mode_request = 'AUTO'
+            self.target_valid = False
+            self.target_x = math.nan
+            self.target_y = math.nan
+            self.speed_scale = 1.0
+
+        elif self.action in ('STOP', 'HOLD'):
+            self.mode_request = 'HOLD'
+            self.target_valid = False
+            self.target_x = math.nan
+            self.target_y = math.nan
+            self.speed_scale = 0.0
+
+        else:
+            self.mode_request = 'HOLD'
+            self.target_valid = False
+            self.target_x = math.nan
+            self.target_y = math.nan
+            self.speed_scale = 0.0
+
+    def publish_status(self):
+
+        active = Bool()
+        active.data = (
+            self.mode_request == 'GUIDED'
+            and self.target_valid
+        )
+        self.active_pub.publish(active)
+
+        valid = Bool()
+        valid.data = self.target_valid
+        self.target_valid_pub.publish(valid)
+
+        x = Float32()
+        x.data = float(self.target_x)
+        self.x_pub.publish(x)
+
+        y = Float32()
+        y.data = float(self.target_y)
+        self.y_pub.publish(y)
+
+        mode = String()
+        mode.data = self.mode_request
+        self.mode_pub.publish(mode)
+
+        speed = Float32()
+        speed.data = float(self.speed_scale)
+        self.speed_pub.publish(speed)
+
+        seq = Int32()
+        seq.data = self.request_seq
+        self.seq_pub.publish(seq)
+
+    def evaluate(self):
+
+        now = time.monotonic()
+
+        # Missing navigation decision = fail safe.
+        if (
+            self.action_time == 0.0
+            or now - self.action_time > self.stale_timeout
+        ):
+            self.action = 'HOLD'
+
+        # Generate a NEW relative target only when action changes.
+        if self.action != self.previous_action:
+            self.handle_action_change()
+            self.previous_action = self.action
+
+            self.get_logger().info(
+                'NEW REQUEST | '
+                f'action={self.action} | '
+                f'mode={self.mode_request} | '
+                f'seq={self.request_seq} | '
+                f'x_forward={self.target_x} | '
+                f'y_right={self.target_y}'
+            )
+
+        self.publish_status()
+
+        if now - self.last_log >= 1.0:
+            self.last_log = now
+
+            self.get_logger().info(
+                'DRY RUN | '
+                f'action={self.action:11s} | '
+                f'mode={self.mode_request:6s} | '
+                f'target_valid={self.target_valid} | '
+                f'x={self.target_x} | '
+                f'y={self.target_y} | '
+                f'speed_scale={self.speed_scale:.2f} | '
+                f'seq={self.request_seq}'
+            )
+
+
+def main(args=None):
+
+    rclpy.init(args=args)
+
+    node = GuidedTargetNode()
+
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+
+    node.destroy_node()
+    rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()

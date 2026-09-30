@@ -24,3 +24,8 @@ mav.parm
 config/local*
 *.key
 *.pem
+
+# ROS 2 workspace generated files
+ros2_ws/build/
+ros2_ws/install/
+ros2_ws/log/

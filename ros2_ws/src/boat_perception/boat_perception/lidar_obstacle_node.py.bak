@@ -1,0 +1,248 @@
+#!/usr/bin/env python3
+
+import math
+import time
+
+import rclpy
+from rclpy.node import Node
+
+from std_msgs.msg import Bool
+from std_msgs.msg import Float32
+from std_msgs.msg import String
+
+
+class LidarObstacleNode(Node):
+
+    def __init__(self):
+        super().__init__('lidar_obstacle_node')
+
+        # Temporary bench-test thresholds.
+        # Later these become speed-dependent.
+        self.declare_parameter('blocked_distance_m', 0.40)
+        self.declare_parameter('caution_distance_m', 0.80)
+        self.declare_parameter('stale_timeout_s', 0.5)
+
+        self.blocked_distance = float(
+            self.get_parameter('blocked_distance_m').value
+        )
+
+        self.caution_distance = float(
+            self.get_parameter('caution_distance_m').value
+        )
+
+        self.stale_timeout = float(
+            self.get_parameter('stale_timeout_s').value
+        )
+
+        self.values = {
+            'front': math.inf,
+            'front_left': math.inf,
+            'left': math.inf,
+            'front_right': math.inf,
+            'right': math.inf,
+        }
+
+        self.timestamps = {
+            name: 0.0
+            for name in self.values
+        }
+
+        for name in self.values:
+            self.create_subscription(
+                Float32,
+                f'/perception/lidar/{name}',
+                lambda msg, n=name: self.distance_callback(n, msg),
+                10,
+            )
+
+        self.state_pub = self.create_publisher(
+            String,
+            '/perception/obstacle/state',
+            10
+        )
+
+        self.preferred_side_pub = self.create_publisher(
+            String,
+            '/perception/obstacle/preferred_side',
+            10
+        )
+
+        self.blocked_pub = self.create_publisher(
+            Bool,
+            '/perception/obstacle/blocked',
+            10
+        )
+
+        self.front_clearance_pub = self.create_publisher(
+            Float32,
+            '/perception/obstacle/front_clearance',
+            10
+        )
+
+        self.left_clearance_pub = self.create_publisher(
+            Float32,
+            '/perception/obstacle/left_clearance',
+            10
+        )
+
+        self.right_clearance_pub = self.create_publisher(
+            Float32,
+            '/perception/obstacle/right_clearance',
+            10
+        )
+
+        self.timer = self.create_timer(
+            0.2,
+            self.evaluate,
+        )
+
+        self.last_log = 0.0
+
+        self.get_logger().info(
+            'LiDAR obstacle node started: '
+            f'blocked<{self.blocked_distance:.2f}m, '
+            f'caution<{self.caution_distance:.2f}m'
+        )
+
+    def distance_callback(self, name, msg):
+        self.values[name] = float(msg.data)
+        self.timestamps[name] = time.monotonic()
+
+    def fresh(self, name, now):
+        return (
+            now - self.timestamps[name]
+            <= self.stale_timeout
+        )
+
+    def safe_min(self, names, now):
+        values = []
+
+        for name in names:
+            if not self.fresh(name, now):
+                continue
+
+            value = self.values[name]
+
+            if math.isfinite(value):
+                values.append(value)
+
+        return min(values) if values else math.inf
+
+    def evaluate(self):
+        now = time.monotonic()
+
+        # Forward collision corridor.
+        front_clearance = self.safe_min(
+            ['front_left', 'front', 'front_right'],
+            now,
+        )
+
+        # Possible escape corridors.
+        left_clearance = self.safe_min(
+            ['front_left', 'left'],
+            now,
+        )
+
+        right_clearance = self.safe_min(
+            ['front_right', 'right'],
+            now,
+        )
+
+        if front_clearance < self.blocked_distance:
+            state = 'BLOCKED'
+
+            if (
+                left_clearance > right_clearance
+                and left_clearance > self.blocked_distance
+            ):
+                preferred_side = 'LEFT'
+
+            elif (
+                right_clearance > left_clearance
+                and right_clearance > self.blocked_distance
+            ):
+                preferred_side = 'RIGHT'
+
+            else:
+                preferred_side = 'NONE'
+
+        elif front_clearance < self.caution_distance:
+            state = 'CAUTION'
+
+            if left_clearance > right_clearance:
+                preferred_side = 'LEFT'
+            elif right_clearance > left_clearance:
+                preferred_side = 'RIGHT'
+            else:
+                preferred_side = 'NONE'
+
+        else:
+            state = 'CLEAR'
+            preferred_side = 'NONE'
+
+        state_msg = String()
+        state_msg.data = state
+        self.state_pub.publish(state_msg)
+
+        side_msg = String()
+        side_msg.data = preferred_side
+        self.preferred_side_pub.publish(side_msg)
+
+        blocked_msg = Bool()
+        blocked_msg.data = state == 'BLOCKED'
+        self.blocked_pub.publish(blocked_msg)
+
+        def publish_float(pub, value):
+            msg = Float32()
+            msg.data = float(value)
+            pub.publish(msg)
+
+        publish_float(
+            self.front_clearance_pub,
+            front_clearance
+        )
+
+        publish_float(
+            self.left_clearance_pub,
+            left_clearance
+        )
+
+        publish_float(
+            self.right_clearance_pub,
+            right_clearance
+        )
+
+        if now - self.last_log >= 0.5:
+            self.last_log = now
+
+            def fmt(value):
+                if math.isfinite(value):
+                    return f'{value:.2f}m'
+                return 'inf'
+
+            self.get_logger().info(
+                f'{state:7s} | '
+                f'front={fmt(front_clearance)} | '
+                f'left={fmt(left_clearance)} | '
+                f'right={fmt(right_clearance)} | '
+                f'preferred={preferred_side}'
+            )
+
+
+def main(args=None):
+    rclpy.init(args=args)
+
+    node = LidarObstacleNode()
+
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+
+    node.destroy_node()
+    rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
+

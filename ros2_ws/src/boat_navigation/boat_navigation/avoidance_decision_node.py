@@ -1,0 +1,382 @@
+#!/usr/bin/env python3
+
+import math
+import time
+
+import rclpy
+from rclpy.node import Node
+from std_msgs.msg import Bool, Float32, String
+
+
+class AvoidanceDecisionNode(Node):
+
+    def __init__(self):
+        super().__init__('avoidance_decision_node')
+
+        self.declare_parameter('stale_timeout_s', 0.75)
+        self.declare_parameter('turn_acquire_clearance_m', 0.40)
+        self.declare_parameter('turn_hold_clearance_m', 0.30)
+
+        self.stale_timeout = float(
+            self.get_parameter('stale_timeout_s').value
+        )
+
+        self.turn_acquire_clearance = float(
+            self.get_parameter('turn_acquire_clearance_m').value
+        )
+
+        self.turn_hold_clearance = float(
+            self.get_parameter('turn_hold_clearance_m').value
+        )
+
+        self.state = 'UNKNOWN'
+        self.valid = False
+        self.preferred_side = 'NONE'
+
+        self.front_clearance = math.inf
+        self.left_clearance = math.inf
+        self.right_clearance = math.inf
+
+        self.timestamps = {
+            'state': 0.0,
+            'valid': 0.0,
+            'preferred_side': 0.0,
+            'front': 0.0,
+            'left': 0.0,
+            'right': 0.0,
+        }
+
+        # Once avoidance begins, do not flip LEFT/RIGHT every frame.
+        self.turn_lock = 'NONE'
+
+        self.subscriptions_ = []
+
+        self.subscriptions_.append(
+            self.create_subscription(
+                String,
+                '/perception/obstacle/state',
+                self.state_callback,
+                10
+            )
+        )
+
+        self.subscriptions_.append(
+            self.create_subscription(
+                Bool,
+                '/perception/obstacle/valid',
+                self.valid_callback,
+                10
+            )
+        )
+
+        self.subscriptions_.append(
+            self.create_subscription(
+                String,
+                '/perception/obstacle/preferred_side',
+                self.side_callback,
+                10
+            )
+        )
+
+        self.subscriptions_.append(
+            self.create_subscription(
+                Float32,
+                '/perception/obstacle/front_clearance',
+                self.front_callback,
+                10
+            )
+        )
+
+        self.subscriptions_.append(
+            self.create_subscription(
+                Float32,
+                '/perception/obstacle/left_clearance',
+                self.left_callback,
+                10
+            )
+        )
+
+        self.subscriptions_.append(
+            self.create_subscription(
+                Float32,
+                '/perception/obstacle/right_clearance',
+                self.right_callback,
+                10
+            )
+        )
+
+        self.action_pub = self.create_publisher(
+            String,
+            '/navigation/avoidance/action',
+            10
+        )
+
+        self.turn_side_pub = self.create_publisher(
+            String,
+            '/navigation/avoidance/turn_side',
+            10
+        )
+
+        self.active_pub = self.create_publisher(
+            Bool,
+            '/navigation/avoidance/active',
+            10
+        )
+
+        self.reason_pub = self.create_publisher(
+            String,
+            '/navigation/avoidance/reason',
+            10
+        )
+
+        self.timer = self.create_timer(
+            0.20,
+            self.evaluate
+        )
+
+        self.last_action = None
+        self.last_log = 0.0
+
+        self.get_logger().info(
+            'Avoidance decision node started '
+            '(decision only -- no Pixhawk control)'
+        )
+
+    def mark(self, key):
+        self.timestamps[key] = time.monotonic()
+
+    def state_callback(self, msg):
+        self.state = msg.data
+        self.mark('state')
+
+    def valid_callback(self, msg):
+        self.valid = bool(msg.data)
+        self.mark('valid')
+
+    def side_callback(self, msg):
+        self.preferred_side = msg.data
+        self.mark('preferred_side')
+
+    def front_callback(self, msg):
+        self.front_clearance = float(msg.data)
+        self.mark('front')
+
+    def left_callback(self, msg):
+        self.left_clearance = float(msg.data)
+        self.mark('left')
+
+    def right_callback(self, msg):
+        self.right_clearance = float(msg.data)
+        self.mark('right')
+
+    def inputs_fresh(self, now):
+        return all(
+            timestamp > 0.0
+            and now - timestamp <= self.stale_timeout
+            for timestamp in self.timestamps.values()
+        )
+
+    def side_clearance(self, side):
+        if side == 'LEFT':
+            return self.left_clearance
+
+        if side == 'RIGHT':
+            return self.right_clearance
+
+        return 0.0
+
+    def side_is_safe(self, side, holding=False):
+        clearance = self.side_clearance(side)
+
+        threshold = (
+            self.turn_hold_clearance
+            if holding
+            else self.turn_acquire_clearance
+        )
+
+        return (
+            math.isinf(clearance)
+            or clearance >= threshold
+        )
+
+    def opposite(self, side):
+        if side == 'LEFT':
+            return 'RIGHT'
+
+        if side == 'RIGHT':
+            return 'LEFT'
+
+        return 'NONE'
+
+    def choose_turn_side(self):
+        # Existing commitment gets priority.
+        if self.turn_lock in ('LEFT', 'RIGHT'):
+            if self.side_is_safe(
+                self.turn_lock,
+                holding=True
+            ):
+                return self.turn_lock
+
+            # Current escape corridor became unsafe.
+            other = self.opposite(self.turn_lock)
+
+            if (
+                self.preferred_side == other
+                and self.side_is_safe(other)
+            ):
+                self.turn_lock = other
+                return other
+
+            self.turn_lock = 'NONE'
+            return 'NONE'
+
+        # No committed direction yet.
+        if (
+            self.preferred_side in ('LEFT', 'RIGHT')
+            and self.side_is_safe(self.preferred_side)
+        ):
+            self.turn_lock = self.preferred_side
+            return self.turn_lock
+
+        return 'NONE'
+
+    def publish(self, action, reason):
+        action_msg = String()
+        action_msg.data = action
+        self.action_pub.publish(action_msg)
+
+        side_msg = String()
+        side_msg.data = self.turn_lock
+        self.turn_side_pub.publish(side_msg)
+
+        active_msg = Bool()
+        active_msg.data = action != 'KEEP_COURSE'
+        self.active_pub.publish(active_msg)
+
+        reason_msg = String()
+        reason_msg.data = reason
+        self.reason_pub.publish(reason_msg)
+
+        now = time.monotonic()
+
+        if (
+            action != self.last_action
+            or now - self.last_log >= 1.0
+        ):
+            self.last_action = action
+            self.last_log = now
+
+            self.get_logger().info(
+                f'action={action:11s} | '
+                f'obstacle={self.state:7s} | '
+                f'preferred={self.preferred_side:5s} | '
+                f'lock={self.turn_lock:5s} | '
+                f'front={self.front_clearance:.2f}m | '
+                f'left={self.left_clearance:.2f}m | '
+                f'right={self.right_clearance:.2f}m | '
+                f'{reason}'
+            )
+
+    def evaluate(self):
+        now = time.monotonic()
+
+        # No trustworthy perception => fail safe.
+        if not self.inputs_fresh(now):
+            self.turn_lock = 'NONE'
+            self.publish(
+                'HOLD',
+                'perception data stale'
+            )
+            return
+
+        if not self.valid or self.state == 'UNKNOWN':
+            self.turn_lock = 'NONE'
+            self.publish(
+                'HOLD',
+                'perception invalid'
+            )
+            return
+
+        # Path fully clear: normal mission can continue.
+        if self.state == 'CLEAR':
+            self.turn_lock = 'NONE'
+            self.publish(
+                'KEEP_COURSE',
+                'forward corridor clear'
+            )
+            return
+
+        # Warning only: slow down, but do not start a turn yet.
+        if self.state == 'CAUTION':
+            # If we were already executing an avoidance turn,
+            # stay committed until CLEAR.
+            if self.turn_lock in ('LEFT', 'RIGHT'):
+                if self.side_is_safe(
+                    self.turn_lock,
+                    holding=True
+                ):
+                    self.publish(
+                        f'TURN_{self.turn_lock}',
+                        'continue committed avoidance'
+                    )
+                    return
+
+                self.turn_lock = 'NONE'
+                self.publish(
+                    'STOP',
+                    'committed escape corridor became unsafe'
+                )
+                return
+
+            self.publish(
+                'SLOW',
+                'obstacle inside caution distance'
+            )
+            return
+
+        if self.state == 'BLOCKED':
+            side = self.choose_turn_side()
+
+            if side == 'LEFT':
+                self.publish(
+                    'TURN_LEFT',
+                    'front blocked; left escape corridor selected'
+                )
+                return
+
+            if side == 'RIGHT':
+                self.publish(
+                    'TURN_RIGHT',
+                    'front blocked; right escape corridor selected'
+                )
+                return
+
+            self.publish(
+                'STOP',
+                'front blocked; no safe escape corridor'
+            )
+            return
+
+        self.turn_lock = 'NONE'
+        self.publish(
+            'HOLD',
+            f'unrecognized obstacle state: {self.state}'
+        )
+
+
+def main(args=None):
+    rclpy.init(args=args)
+
+    node = AvoidanceDecisionNode()
+
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+
+    node.destroy_node()
+    rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()

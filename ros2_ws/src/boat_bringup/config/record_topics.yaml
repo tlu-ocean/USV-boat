@@ -1,0 +1,28 @@
+topics:
+
+  # Pixhawk
+  - /boat/mavlink/connected
+  - /boat/gps/fix
+  - /boat/gps/fix_type
+  - /boat/gps/satellites
+  - /boat/heading
+  - /boat/course
+  - /boat/speed
+  - /boat/mode
+  - /boat/armed
+  - /boat/battery
+
+  # TFmini
+  - /sensors/tfmini/range
+  - /sensors/tfmini/strength
+  - /sensors/tfmini/internal_temperature
+
+  # BME280
+  - /environment/air_temperature
+  - /environment/relative_humidity
+  - /environment/air_pressure
+
+  # AIS
+  - /ais/connected
+  - /ais/target_count
+  - /ais/targets

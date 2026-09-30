@@ -1,0 +1,446 @@
+#!/usr/bin/env python3
+
+import math
+import time
+
+import rclpy
+from rclpy.node import Node
+from std_msgs.msg import Bool, Float32, String
+
+
+class LidarObstacleNode(Node):
+
+    def __init__(self):
+        super().__init__('lidar_obstacle_node')
+
+        # ---------- Distance thresholds ----------
+        # Enter danger sooner; require more clearance to leave it.
+        self.declare_parameter('blocked_enter_m', 0.40)
+        self.declare_parameter('blocked_exit_m', 0.50)
+
+        self.declare_parameter('caution_enter_m', 0.80)
+        self.declare_parameter('caution_exit_m', 0.90)
+
+        # Require several evaluation cycles before reducing severity.
+        self.declare_parameter('release_confirm_cycles', 3)
+
+        # LiDAR data older than this is invalid.
+        self.declare_parameter('stale_timeout_s', 0.50)
+
+        # LEFT/RIGHT must differ by at least this much before choosing.
+        self.declare_parameter('side_margin_m', 0.10)
+
+        self.blocked_enter = float(
+            self.get_parameter('blocked_enter_m').value
+        )
+        self.blocked_exit = float(
+            self.get_parameter('blocked_exit_m').value
+        )
+        self.caution_enter = float(
+            self.get_parameter('caution_enter_m').value
+        )
+        self.caution_exit = float(
+            self.get_parameter('caution_exit_m').value
+        )
+        self.release_confirm_cycles = int(
+            self.get_parameter('release_confirm_cycles').value
+        )
+        self.stale_timeout = float(
+            self.get_parameter('stale_timeout_s').value
+        )
+        self.side_margin = float(
+            self.get_parameter('side_margin_m').value
+        )
+
+        # ---------- Input data ----------
+        self.values = {
+            'front_corridor': math.inf,
+            'front': math.inf,
+            'front_left': math.inf,
+            'left': math.inf,
+            'front_right': math.inf,
+            'right': math.inf,
+        }
+
+        self.timestamps = {
+            name: 0.0
+            for name in self.values
+        }
+
+        # Keep subscription objects alive.
+        self.subscriptions_ = []
+
+        for name in self.values:
+            sub = self.create_subscription(
+                Float32,
+                f'/perception/lidar/{name}',
+                lambda msg, n=name: self.distance_callback(n, msg),
+                10,
+            )
+            self.subscriptions_.append(sub)
+
+        # ---------- State ----------
+        self.state = 'UNKNOWN'
+        self.pending_release_state = None
+        self.pending_release_count = 0
+
+        # ---------- Publishers ----------
+        self.state_pub = self.create_publisher(
+            String,
+            '/perception/obstacle/state',
+            10
+        )
+
+        self.raw_state_pub = self.create_publisher(
+            String,
+            '/perception/obstacle/raw_state',
+            10
+        )
+
+        self.preferred_side_pub = self.create_publisher(
+            String,
+            '/perception/obstacle/preferred_side',
+            10
+        )
+
+        self.blocked_pub = self.create_publisher(
+            Bool,
+            '/perception/obstacle/blocked',
+            10
+        )
+
+        self.valid_pub = self.create_publisher(
+            Bool,
+            '/perception/obstacle/valid',
+            10
+        )
+
+        self.front_clearance_pub = self.create_publisher(
+            Float32,
+            '/perception/obstacle/front_clearance',
+            10
+        )
+
+        self.left_clearance_pub = self.create_publisher(
+            Float32,
+            '/perception/obstacle/left_clearance',
+            10
+        )
+
+        self.right_clearance_pub = self.create_publisher(
+            Float32,
+            '/perception/obstacle/right_clearance',
+            10
+        )
+
+        self.timer = self.create_timer(
+            0.20,
+            self.evaluate
+        )
+
+        self.last_log = 0.0
+
+        self.get_logger().info(
+            'LiDAR obstacle node started | '
+            f'BLOCKED enter<{self.blocked_enter:.2f}m '
+            f'exit>{self.blocked_exit:.2f}m | '
+            f'CAUTION enter<{self.caution_enter:.2f}m '
+            f'exit>{self.caution_exit:.2f}m'
+        )
+
+    def distance_callback(self, name, msg):
+        self.values[name] = float(msg.data)
+        self.timestamps[name] = time.monotonic()
+
+    def fresh(self, name, now):
+        return (
+            self.timestamps[name] > 0.0
+            and now - self.timestamps[name] <= self.stale_timeout
+        )
+
+    def safe_min(self, names):
+        values = [
+            self.values[name]
+            for name in names
+            if math.isfinite(self.values[name])
+        ]
+
+        return min(values) if values else math.inf
+
+    def desired_state(self, front_clearance):
+        """
+        Raw state with hysteresis.
+
+        Escalation:
+          CLEAR -> CAUTION below 0.80
+          anything -> BLOCKED below 0.40
+
+        Recovery:
+          BLOCKED does not release until >0.50
+          CAUTION does not release until >0.90
+        """
+
+        if self.state == 'BLOCKED':
+            if front_clearance < self.blocked_exit:
+                return 'BLOCKED'
+
+            if front_clearance < self.caution_exit:
+                return 'CAUTION'
+
+            return 'CLEAR'
+
+        if self.state == 'CAUTION':
+            if front_clearance < self.blocked_enter:
+                return 'BLOCKED'
+
+            if front_clearance < self.caution_exit:
+                return 'CAUTION'
+
+            return 'CLEAR'
+
+        # CLEAR or initial recovery from UNKNOWN
+        if front_clearance < self.blocked_enter:
+            return 'BLOCKED'
+
+        if front_clearance < self.caution_enter:
+            return 'CAUTION'
+
+        return 'CLEAR'
+
+    def update_stable_state(self, desired):
+        severity = {
+            'CLEAR': 0,
+            'CAUTION': 1,
+            'BLOCKED': 2,
+        }
+
+        # Once valid data returns after UNKNOWN,
+        # accept the current measured state immediately.
+        if self.state == 'UNKNOWN':
+            self.state = desired
+            self.pending_release_state = None
+            self.pending_release_count = 0
+            return
+
+        if desired == self.state:
+            self.pending_release_state = None
+            self.pending_release_count = 0
+            return
+
+        # Danger escalation is immediate.
+        if severity[desired] > severity[self.state]:
+            self.state = desired
+            self.pending_release_state = None
+            self.pending_release_count = 0
+            return
+
+        # Recovery is deliberately slower.
+        if self.pending_release_state != desired:
+            self.pending_release_state = desired
+            self.pending_release_count = 1
+        else:
+            self.pending_release_count += 1
+
+        if self.pending_release_count >= self.release_confirm_cycles:
+            self.state = desired
+            self.pending_release_state = None
+            self.pending_release_count = 0
+
+    def choose_side(self, left_clearance, right_clearance):
+        # Both directions effectively open.
+        if (
+            math.isinf(left_clearance)
+            and math.isinf(right_clearance)
+        ):
+            return 'NONE'
+
+        if math.isinf(left_clearance):
+            return 'LEFT'
+
+        if math.isinf(right_clearance):
+            return 'RIGHT'
+
+        # Do not switch direction for tiny differences.
+        difference = left_clearance - right_clearance
+
+        if abs(difference) < self.side_margin:
+            return 'NONE'
+
+        if (
+            difference > 0
+            and left_clearance > self.blocked_enter
+        ):
+            return 'LEFT'
+
+        if (
+            difference < 0
+            and right_clearance > self.blocked_enter
+        ):
+            return 'RIGHT'
+
+        return 'NONE'
+
+    def publish_float(self, publisher, value):
+        msg = Float32()
+        msg.data = float(value)
+        publisher.publish(msg)
+
+    def evaluate(self):
+        now = time.monotonic()
+
+        required = [
+            'front_corridor',
+            'front',
+            'front_left',
+            'front_right',
+            'left',
+            'right',
+        ]
+
+        all_fresh = all(
+            self.fresh(name, now)
+            for name in required
+        )
+
+        # Sensor failure / stale data is NOT clear.
+        if not all_fresh:
+            self.state = 'UNKNOWN'
+            self.pending_release_state = None
+            self.pending_release_count = 0
+
+            msg = String()
+            msg.data = 'UNKNOWN'
+            self.state_pub.publish(msg)
+
+            raw_msg = String()
+            raw_msg.data = 'UNKNOWN'
+            self.raw_state_pub.publish(raw_msg)
+
+            side_msg = String()
+            side_msg.data = 'NONE'
+            self.preferred_side_pub.publish(side_msg)
+
+            valid_msg = Bool()
+            valid_msg.data = False
+            self.valid_pub.publish(valid_msg)
+
+            blocked_msg = Bool()
+            blocked_msg.data = False
+            self.blocked_pub.publish(blocked_msg)
+
+            if now - self.last_log >= 0.5:
+                self.last_log = now
+                self.get_logger().warning(
+                    'UNKNOWN | LiDAR sector data missing/stale'
+                )
+
+            return
+
+        # Forward collision corridor.
+        front_clearance = self.safe_min([
+            'front_corridor',
+        ])
+
+        # Escape corridors.
+        left_clearance = self.safe_min([
+            'front_left',
+            'left',
+        ])
+
+        right_clearance = self.safe_min([
+            'front_right',
+            'right',
+        ])
+
+        raw_state = self.desired_state(front_clearance)
+        self.update_stable_state(raw_state)
+
+        if self.state in ('CAUTION', 'BLOCKED'):
+            preferred_side = self.choose_side(
+                left_clearance,
+                right_clearance,
+            )
+        else:
+            preferred_side = 'NONE'
+
+        # ---------- Publish ----------
+        state_msg = String()
+        state_msg.data = self.state
+        self.state_pub.publish(state_msg)
+
+        raw_msg = String()
+        raw_msg.data = raw_state
+        self.raw_state_pub.publish(raw_msg)
+
+        side_msg = String()
+        side_msg.data = preferred_side
+        self.preferred_side_pub.publish(side_msg)
+
+        valid_msg = Bool()
+        valid_msg.data = True
+        self.valid_pub.publish(valid_msg)
+
+        blocked_msg = Bool()
+        blocked_msg.data = self.state == 'BLOCKED'
+        self.blocked_pub.publish(blocked_msg)
+
+        self.publish_float(
+            self.front_clearance_pub,
+            front_clearance
+        )
+
+        self.publish_float(
+            self.left_clearance_pub,
+            left_clearance
+        )
+
+        self.publish_float(
+            self.right_clearance_pub,
+            right_clearance
+        )
+
+        if now - self.last_log >= 0.5:
+            self.last_log = now
+
+            def fmt(value):
+                if math.isfinite(value):
+                    return f'{value:.2f}m'
+                return 'inf'
+
+            pending = ''
+
+            if self.pending_release_count > 0:
+                pending = (
+                    f' | release='
+                    f'{self.pending_release_state}'
+                    f'({self.pending_release_count}/'
+                    f'{self.release_confirm_cycles})'
+                )
+
+            self.get_logger().info(
+                f'{self.state:7s} '
+                f'(raw={raw_state:7s}) | '
+                f'corridor={fmt(front_clearance)} | '
+                f'left={fmt(left_clearance)} | '
+                f'right={fmt(right_clearance)} | '
+                f'preferred={preferred_side}'
+                f'{pending}'
+            )
+
+
+def main(args=None):
+    rclpy.init(args=args)
+
+    node = LidarObstacleNode()
+
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+
+    node.destroy_node()
+    rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()

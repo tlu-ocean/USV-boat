@@ -1,0 +1,36 @@
+tfmini_node:
+  ros__parameters:
+    port: "/dev/ttyAMA3"
+    baud: 115200
+    frame_id: "tfmini_link"
+    min_range: 0.10
+    max_range: 12.0
+    field_of_view_deg: 3.6
+
+
+bme280_node:
+  ros__parameters:
+    i2c_bus: 1
+    address: 118
+    frame_id: "bme280_link"
+    publish_rate_hz: 1.0
+
+
+pixhawk_node:
+  ros__parameters:
+    port: "/dev/serial0"
+    baud: 115200
+    gps_frame_id: "gps_link"
+    poll_rate_hz: 100.0
+    reconnect_interval_s: 2.0
+    heartbeat_timeout_s: 3.0
+
+
+ais_node:
+  ros__parameters:
+    port: "/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0"
+    baud: 38400
+    reconnect_interval_s: 2.0
+    active_timeout_s: 60.0
+    remove_timeout_s: 300.0
+    publish_rate_hz: 1.0

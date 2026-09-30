@@ -1,0 +1,513 @@
+#!/usr/bin/env python3
+
+import math
+import statistics
+import time
+
+import rclpy
+from rclpy.node import Node
+from sensor_msgs.msg import LaserScan
+from std_msgs.msg import Float32
+
+
+def wrap_deg(angle):
+    """Wrap angle to [-180, 180)."""
+    return (angle + 180.0) % 360.0 - 180.0
+
+
+class LidarSectorNode(Node):
+
+    def __init__(self):
+        super().__init__('lidar_sector_node')
+
+        # LiDAR angle corresponding to boat forward.
+        self.declare_parameter('front_angle_deg', 0.0)
+
+        # Ignore extremely close returns for now.
+        # Later this will be replaced/refined with boat-body masks.
+        self.declare_parameter('min_obstacle_range_m', 0.05)
+
+        # A real obstacle needs several neighboring scan points.
+        self.declare_parameter('min_cluster_points', 8)
+
+        # Maximum angular gap between neighboring valid points
+        # expressed as multiples of LaserScan angle_increment.
+        self.declare_parameter('max_gap_factor', 3.0)
+
+        # Cartesian collision corridor.
+        # For bench testing this is simply total half-width.
+        # Later:
+        # corridor_half_width_m =
+        # boat_half_width + safety_margin
+        self.declare_parameter('corridor_half_width_m', 0.50)
+        self.declare_parameter('corridor_lookahead_m', 3.00)
+
+        # Start of collision corridor in front of LiDAR.
+        # Bench value now; later set to actual LiDAR-to-bow distance.
+        self.declare_parameter('corridor_start_x_m', 0.20)
+
+        # Split neighboring points into different objects if
+        # their radial ranges jump too much.
+        self.declare_parameter(
+            'corridor_cluster_range_jump_m',
+            0.30
+        )
+
+        self.front_angle_deg = float(
+            self.get_parameter('front_angle_deg').value
+        )
+
+        self.min_obstacle_range_m = float(
+            self.get_parameter('min_obstacle_range_m').value
+        )
+
+        self.min_cluster_points = int(
+            self.get_parameter('min_cluster_points').value
+        )
+
+        self.max_gap_factor = float(
+            self.get_parameter('max_gap_factor').value
+        )
+
+        self.corridor_half_width_m = float(
+            self.get_parameter('corridor_half_width_m').value
+        )
+
+        self.corridor_lookahead_m = float(
+            self.get_parameter('corridor_lookahead_m').value
+        )
+
+        self.corridor_start_x_m = float(
+            self.get_parameter('corridor_start_x_m').value
+        )
+
+        self.corridor_cluster_range_jump_m = float(
+            self.get_parameter(
+                'corridor_cluster_range_jump_m'
+            ).value
+        )
+
+        # 8 sectors, each 45 degrees.
+        # Positive angle = left, negative angle = right.
+        self.sectors = {
+            'front':        0.0,
+            'front_left':  45.0,
+            'left':        90.0,
+            'back_left':  135.0,
+            'rear':       180.0,
+            'back_right': -135.0,
+            'right':       -90.0,
+            'front_right': -45.0,
+        }
+
+        self.sector_half_width_deg = 22.5
+
+        self.publishers_ = {}
+
+        for name in self.sectors:
+            self.publishers_[name] = self.create_publisher(
+                Float32,
+                f'/perception/lidar/{name}',
+                10
+            )
+
+        self.front_corridor_pub = self.create_publisher(
+            Float32,
+            '/perception/lidar/front_corridor',
+            10
+        )
+
+        self.nearest_distance_pub = self.create_publisher(
+            Float32,
+            '/perception/lidar/nearest_distance',
+            10
+        )
+
+        self.nearest_angle_pub = self.create_publisher(
+            Float32,
+            '/perception/lidar/nearest_angle_deg',
+            10
+        )
+
+        self.subscription = self.create_subscription(
+            LaserScan,
+            '/scan',
+            self.scan_callback,
+            10
+        )
+
+        self.last_log_time = 0.0
+
+        self.get_logger().info(
+            'LiDAR sector node started: '
+            f'front={self.front_angle_deg:.1f} deg, '
+            f'min_range={self.min_obstacle_range_m:.2f} m, '
+            f'min_cluster_points={self.min_cluster_points}'
+        )
+
+    def extract_clusters(
+        self,
+        points,
+        angle_increment_deg,
+    ):
+        """
+        points: list of (sector_relative_angle_deg, distance)
+
+        Points must already be inside one sector.
+        """
+
+        if not points:
+            return []
+
+        points.sort(key=lambda x: x[0])
+
+        max_gap_deg = (
+            abs(angle_increment_deg)
+            * self.max_gap_factor
+        )
+
+        clusters = []
+        current = [points[0]]
+
+        for point in points[1:]:
+
+            previous = current[-1]
+
+            angular_gap = point[0] - previous[0]
+
+            if angular_gap <= max_gap_deg:
+                current.append(point)
+            else:
+                clusters.append(current)
+                current = [point]
+
+        clusters.append(current)
+
+        return [
+            cluster
+            for cluster in clusters
+            if len(cluster) >= self.min_cluster_points
+        ]
+
+    def sector_distance(
+        self,
+        valid_points,
+        center_deg,
+        angle_increment_deg,
+    ):
+
+        sector_points = []
+
+        for relative_angle_deg, distance in valid_points:
+
+            delta = wrap_deg(
+                relative_angle_deg - center_deg
+            )
+
+            if abs(delta) <= self.sector_half_width_deg:
+                # Sorting by delta also handles the REAR sector
+                # correctly across +/-180 degrees.
+                sector_points.append(
+                    (delta, distance)
+                )
+
+        clusters = self.extract_clusters(
+            sector_points,
+            angle_increment_deg,
+        )
+
+        if not clusters:
+            return math.inf, math.nan
+
+        candidates = []
+
+        for cluster in clusters:
+
+            distances = [
+                point[1]
+                for point in cluster
+            ]
+
+            # Median prevents one unusually short point
+            # from defining an entire obstacle.
+            distance = statistics.median(distances)
+
+            angles = [
+                point[0]
+                for point in cluster
+            ]
+
+            cluster_angle = statistics.mean(angles)
+
+            candidates.append(
+                (distance, cluster_angle)
+            )
+
+        # Nearest legitimate cluster inside this sector.
+        distance, local_angle = min(
+            candidates,
+            key=lambda x: x[0]
+        )
+
+        absolute_relative_angle = wrap_deg(
+            center_deg + local_angle
+        )
+
+        return distance, absolute_relative_angle
+
+    def corridor_distance(
+        self,
+        valid_points,
+        angle_increment_deg,
+    ):
+        """
+        Rectangular collision corridor in boat coordinates.
+
+        x = forward
+        y = left/right
+
+        Corridor begins at corridor_start_x_m rather than
+        at the LiDAR optical center.
+
+        Returned value is clearance AHEAD OF the corridor start.
+        """
+
+        candidates = []
+
+        for angle_deg, distance in valid_points:
+
+            theta = math.radians(angle_deg)
+
+            x = distance * math.cos(theta)
+            y = distance * math.sin(theta)
+
+            # Ignore everything behind the front edge of
+            # the collision corridor.
+            if x <= self.corridor_start_x_m:
+                continue
+
+            clearance = x - self.corridor_start_x_m
+
+            if clearance > self.corridor_lookahead_m:
+                continue
+
+            if abs(y) > self.corridor_half_width_m:
+                continue
+
+            candidates.append(
+                (angle_deg, distance, clearance)
+            )
+
+        if not candidates:
+            return math.inf
+
+        candidates.sort(key=lambda p: p[0])
+
+        max_angle_gap = (
+            abs(angle_increment_deg)
+            * self.max_gap_factor
+        )
+
+        clusters = []
+        current = [candidates[0]]
+
+        for point in candidates[1:]:
+
+            previous = current[-1]
+
+            angle_gap = point[0] - previous[0]
+
+            range_jump = abs(
+                point[1] - previous[1]
+            )
+
+            if (
+                angle_gap <= max_angle_gap
+                and range_jump
+                <= self.corridor_cluster_range_jump_m
+            ):
+                current.append(point)
+            else:
+                clusters.append(current)
+                current = [point]
+
+        clusters.append(current)
+
+        clusters = [
+            cluster
+            for cluster in clusters
+            if len(cluster) >= self.min_cluster_points
+        ]
+
+        if not clusters:
+            return math.inf
+
+        clearances = []
+
+        for cluster in clusters:
+
+            values = [
+                point[2]
+                for point in cluster
+            ]
+
+            clearances.append(
+                statistics.median(values)
+            )
+
+        return min(clearances)
+
+    def scan_callback(self, msg):
+
+        valid_points = []
+
+        angle_increment_deg = math.degrees(
+            msg.angle_increment
+        )
+
+        effective_min_range = max(
+            msg.range_min,
+            self.min_obstacle_range_m,
+        )
+
+        for i, distance in enumerate(msg.ranges):
+
+            if not math.isfinite(distance):
+                continue
+
+            if distance < effective_min_range:
+                continue
+
+            if distance > msg.range_max:
+                continue
+
+            lidar_angle_rad = (
+                msg.angle_min
+                + i * msg.angle_increment
+            )
+
+            lidar_angle_deg = math.degrees(
+                lidar_angle_rad
+            )
+
+            # Convert LiDAR coordinates to boat-relative angle.
+            relative_angle_deg = wrap_deg(
+                lidar_angle_deg
+                - self.front_angle_deg
+            )
+
+            valid_points.append(
+                (
+                    relative_angle_deg,
+                    distance,
+                )
+            )
+
+        corridor_clearance = self.corridor_distance(
+            valid_points,
+            angle_increment_deg,
+        )
+
+        corridor_msg = Float32()
+        corridor_msg.data = float(corridor_clearance)
+        self.front_corridor_pub.publish(corridor_msg)
+
+        results = {}
+        sector_angles = {}
+
+        for name, center_deg in self.sectors.items():
+
+            distance, angle = self.sector_distance(
+                valid_points,
+                center_deg,
+                angle_increment_deg,
+            )
+
+            results[name] = distance
+            sector_angles[name] = angle
+
+            out = Float32()
+            out.data = float(distance)
+
+            self.publishers_[name].publish(out)
+
+        # Find nearest accepted obstacle among sectors.
+        finite_sectors = [
+            (
+                name,
+                results[name],
+                sector_angles[name],
+            )
+            for name in results
+            if math.isfinite(results[name])
+        ]
+
+        if finite_sectors:
+
+            nearest_name, nearest_distance, nearest_angle = min(
+                finite_sectors,
+                key=lambda x: x[1]
+            )
+
+        else:
+            nearest_name = 'none'
+            nearest_distance = math.inf
+            nearest_angle = math.nan
+
+        distance_msg = Float32()
+        distance_msg.data = float(nearest_distance)
+        self.nearest_distance_pub.publish(
+            distance_msg
+        )
+
+        angle_msg = Float32()
+        angle_msg.data = float(nearest_angle)
+        self.nearest_angle_pub.publish(
+            angle_msg
+        )
+
+        now = time.monotonic()
+
+        if now - self.last_log_time >= 0.5:
+
+            self.last_log_time = now
+
+            def fmt(value):
+                if math.isfinite(value):
+                    return f'{value:4.2f}m'
+                return ' inf '
+
+            self.get_logger().info(
+                ' | '.join([
+                    f"F {fmt(results['front'])}",
+                    f"FL {fmt(results['front_left'])}",
+                    f"L {fmt(results['left'])}",
+                    f"BL {fmt(results['back_left'])}",
+                    f"B {fmt(results['rear'])}",
+                    f"BR {fmt(results['back_right'])}",
+                    f"R {fmt(results['right'])}",
+                    f"FR {fmt(results['front_right'])}",
+                ])
+                + f' || corridor={fmt(corridor_clearance)}'
+                + f' | nearest={nearest_name} '
+                + fmt(nearest_distance)
+            )
+
+
+def main(args=None):
+
+    rclpy.init(args=args)
+
+    node = LidarSectorNode()
+
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+
+    node.destroy_node()
+    rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
