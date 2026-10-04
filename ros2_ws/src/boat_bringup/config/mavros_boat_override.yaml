@@ -1,0 +1,3 @@
+/**/obstacle:
+  ros__parameters:
+    mav_frame: "BODY_FRD"

@@ -1,0 +1,17 @@
+/**:
+  ros__parameters:
+    plugin_denylist:
+      - actuator_control
+      - ftp
+      - hil
+      - altitude
+      - debug_value
+      - image_pub
+      - px4flow
+      - vibration
+      - vision_speed_estimate
+      - wheel_odometry
+
+      # Pixhawk re-publishes AP_Proximity sectors as DISTANCE_SENSOR
+      # IDs 10-17. We currently do not use MAVROS Range mappings for them.
+      - distance_sensor
