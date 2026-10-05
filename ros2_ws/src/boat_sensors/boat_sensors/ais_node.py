@@ -152,9 +152,22 @@ class AisNode(Node):
             10,
         )
 
+        # Legacy topic: means AIS message activity, NOT serial state.
         self.connected_pub = self.create_publisher(
             Bool,
             "/ais/connected",
+            10,
+        )
+
+        self.serial_connected_pub = self.create_publisher(
+            Bool,
+            "/ais/serial_connected",
+            10,
+        )
+
+        self.rx_active_pub = self.create_publisher(
+            Bool,
+            "/ais/rx_active",
             10,
         )
 
@@ -603,21 +616,43 @@ class AisNode(Node):
             count_msg
         )
 
-        connected_msg = Bool()
+        # Serial layer: can the process currently access an open port?
+        serial_connected = (
+            self.ser is not None
+            and getattr(self.ser, "is_open", False)
+        )
 
+        serial_msg = Bool()
+        serial_msg.data = serial_connected
+
+        self.serial_connected_pub.publish(
+            serial_msg
+        )
+
+        # RF/message layer: have we recently received AIS traffic?
         if self.last_message_time is None:
 
-            connected = False
+            rx_active = False
 
         else:
 
-            connected = (
+            rx_active = (
                 now
                 - self.last_message_time
                 < 30.0
             )
 
-        connected_msg.data = connected
+        rx_msg = Bool()
+        rx_msg.data = rx_active
+
+        self.rx_active_pub.publish(
+            rx_msg
+        )
+
+        # Backward compatibility: /ais/connected retains its old
+        # meaning (recent AIS traffic).
+        connected_msg = Bool()
+        connected_msg.data = rx_active
 
         self.connected_pub.publish(
             connected_msg

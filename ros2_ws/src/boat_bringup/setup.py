@@ -68,6 +68,8 @@ setup(
     tests_require=['pytest'],
 
     entry_points={
-        'console_scripts': [],
+        'console_scripts': [
+            'boat_health = boat_bringup.boat_health_node:main',
+        ],
     },
 )
